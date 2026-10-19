@@ -6,6 +6,7 @@ import { handlePrismaError } from "@/lib/prisma-errors";
 import { logger } from "@/lib/logger";
 import { getCurrentRequestId } from "@/lib/request-logging";
 import { ERROR_CODES } from "@/lib/error-codes";
+import { captureError } from "@/lib/sentry";
 
 // ── Standard Response Types ────────────────────────────────────
 
@@ -21,6 +22,17 @@ interface ApiSuccess<T> {
     nextCursor?: string | null;
     /** Whether more rows exist after this page. */
     hasMore?: boolean;
+    /**
+     * True when a reader had to cap its result set (#742). Mirrors the
+     * `truncated` flag on the on-chain `PaymentList` / `HookList` readers and
+     * the governance proposal list: callers must treat the payload as partial
+     * instead of assuming it is complete.
+     */
+    truncated?: boolean;
+    /** True when a request was replayed with an already-seen idempotency key. */
+    deduplicated?: boolean;
+    /** True when a replayed batch resumed its missing child payments. */
+    resumed?: boolean;
   };
 }
 
@@ -78,7 +90,9 @@ export function successResponse<T>(
   data: T,
   meta?: ApiSuccess<T>["meta"],
   status = 200,
-  cacheHeader?: string
+  // A bare string sets `Cache-Control`; a record sets arbitrary response
+  // headers (e.g. `readCacheHeaders()` → Cache-Control + X-Cache-Status, #741).
+  cacheHeader?: string | Record<string, string>
 ) {
   const response = NextResponse.json(
     {
@@ -88,8 +102,12 @@ export function successResponse<T>(
     } satisfies ApiSuccess<T>,
     { status }
   );
-  if (cacheHeader) {
+  if (typeof cacheHeader === "string") {
     response.headers.set("Cache-Control", cacheHeader);
+  } else if (cacheHeader) {
+    for (const [key, value] of Object.entries(cacheHeader)) {
+      response.headers.set(key, value);
+    }
   }
   return response;
 }
@@ -131,6 +149,31 @@ export function unauthorizedError(message = "Unauthorized") {
   return errorResponse(ERROR_CODES.UNAUTHORIZED, message, 401);
 }
 
+
+export function rateLimitError(
+  message = "Too many requests",
+  retryAfterSeconds?: number,
+  extraHeaders?: Record<string, string>,
+  details?: unknown
+) {
+  const headers: Record<string, string> = { ...(extraHeaders ?? {}) };
+  if (retryAfterSeconds !== undefined) {
+    headers["Retry-After"] = String(Math.max(0, Math.floor(retryAfterSeconds)));
+  }
+  return NextResponse.json(
+    {
+      success: false,
+      error: {
+        code: ERROR_CODES.RATE_LIMITED,
+        message,
+        ...(details === undefined ? {} : { details: jsonSafe(details) }),
+      },
+      timestamp: new Date().toISOString(),
+    } satisfies ApiError,
+    { status: 429, headers }
+  );
+}
+
 export function forbiddenError(
   message = "Forbidden",
   details?: unknown
@@ -138,12 +181,26 @@ export function forbiddenError(
   return errorResponse(ERROR_CODES.INSUFFICIENT_SCOPE, message, 403, details);
 }
 
-export function rateLimitError(message = "Too many requests") {
-  return errorResponse(ERROR_CODES.RATE_LIMITED, message, 429);
-}
-
-export function conflictError(message: string) {
-  return errorResponse(ERROR_CODES.CONFLICT, message, 409);
+/**
+ * 409 response.
+ *
+ * `headers` carries protocol-level guidance that belongs with the conflict
+ * rather than in the body — most importantly `Retry-After` when a concurrent
+ * request is still holding the caller's idempotency key (issue #1366).
+ */
+export function conflictError(
+  message: string,
+  headers?: Record<string, string>,
+  code: string = ERROR_CODES.CONFLICT
+) {
+  return NextResponse.json(
+    {
+      success: false,
+      error: { code, message },
+      timestamp: new Date().toISOString(),
+    } satisfies ApiError,
+    { status: 409, headers: headers ?? {} }
+  );
 }
 
 export function badRequestError(message: string) {
@@ -153,13 +210,14 @@ export function badRequestError(message: string) {
 // ── Unified Error Handler ──────────────────────────────────────
 
 /**
- * Map any caught error to a proper API error response.
+ * Log a caught error, correlating it with the request id.
  *
- * • Prisma errors → correct HTTP status (404, 409, 503, etc.)
- * • Zod validation errors → 400 with field details
- * • Generic errors → 500 (masked in production for security)
+ * Shared by the legacy envelope handler (`handleApiError`) and the RFC 7807
+ * handler (`problemFromError` in `src/lib/api-errors.ts`) so both wire formats
+ * produce identical observability: one structured log line, plus a Sentry
+ * capture for anything that is not a client validation error.
  */
-export function handleApiError(err: unknown, context?: string): NextResponse {
+export function logApiError(err: unknown, context?: string): void {
   // Log the real error for debugging — the request id (set by the request
   // logging middleware) lets operators correlate the log with the
   // X-Request-Id returned to the client.
@@ -169,13 +227,41 @@ export function handleApiError(err: unknown, context?: string): NextResponse {
     stack: err instanceof Error ? err.stack : undefined,
   });
 
+  if (process.env.NEXT_PUBLIC_SENTRY_DSN && !(err instanceof z.ZodError)) {
+    captureError(err instanceof Error ? err : new Error(String(err)), {
+      component: context ?? "API",
+    });
+  }
+}
+
+/** A caught error reduced to the HTTP facts every response format needs. */
+export interface ClassifiedApiError {
+  code: string;
+  message: string;
+  status: number;
+  /** Structured context for the legacy envelope's `error.details` member. */
+  details?: unknown;
+}
+
+/**
+ * Map any caught error to a code/message/status triple.
+ *
+ * • Prisma errors → correct HTTP status (404, 409, 503, etc.)
+ * • Zod validation errors → 400 with the joined issue messages
+ * • Generic errors → 500 (masked in production for security)
+ *
+ * Kept separate from the response builders so the envelope format and the RFC
+ * 7807 format cannot disagree about *what* went wrong — only about how it is
+ * serialized.
+ */
+export function classifyApiError(err: unknown): ClassifiedApiError {
   // Zod validation errors (check first — before Prisma instance checks)
   if (err instanceof z.ZodError) {
-    return errorResponse(
-      ERROR_CODES.VALIDATION_ERROR,
-      err.issues.map((e) => e.message).join("; "),
-      400
-    );
+    return {
+      code: ERROR_CODES.VALIDATION_ERROR,
+      message: err.issues.map((e) => e.message).join("; "),
+      status: 400,
+    };
   }
 
   // Prisma errors — use handlePrismaError which knows all Prisma error types
@@ -189,7 +275,7 @@ export function handleApiError(err: unknown, context?: string): NextResponse {
      err.constructor.name === "PrismaClientRustPanicError")
   ) {
     const mapped = handlePrismaError(err);
-    return errorResponse(mapped.code, mapped.message, mapped.status);
+    return { code: mapped.code, message: mapped.message, status: mapped.status };
   }
 
   // Fallback for Prisma errors detected by code pattern
@@ -197,7 +283,11 @@ export function handleApiError(err: unknown, context?: string): NextResponse {
     const prismaCode = (err as { code: string }).code;
     if (typeof prismaCode === "string" && prismaCode.startsWith("P")) {
       const mapped = handlePrismaError(err);
-      return errorResponse(mapped.code, mapped.message, mapped.status);
+      return {
+        code: mapped.code,
+        message: mapped.message,
+        status: mapped.status,
+      };
     }
   }
 
@@ -209,5 +299,17 @@ export function handleApiError(err: unknown, context?: string): NextResponse {
         ? err.message
         : "An unexpected error occurred.";
 
-  return serverError(message);
+  return { code: ERROR_CODES.INTERNAL_ERROR, message, status: 500 };
+}
+
+/**
+ * Map any caught error to a legacy-envelope API error response.
+ *
+ * Kept for the routes that have not migrated to RFC 7807 yet; new payment
+ * mutation routes use `problemFromError` in `src/lib/api-errors.ts`.
+ */
+export function handleApiError(err: unknown, context?: string): NextResponse {
+  logApiError(err, context);
+  const { code, message, status, details } = classifyApiError(err);
+  return errorResponse(code, message, status, details);
 }

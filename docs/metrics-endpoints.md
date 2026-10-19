@@ -24,6 +24,13 @@ series instead of one series per concrete id.
 | --- | --- | --- | --- |
 | `ophirpay_endpoint_request_duration_seconds` | histogram | `method`, `endpoint`, `status_class`, `le` | Request latency per endpoint + status class |
 | `ophirpay_endpoint_errors_total` | counter | `method`, `endpoint`, `status_class` | Error counts per endpoint + status class |
+| `ophirpay_sse_open_connections` | gauge | — | Currently open SSE event-stream connections (both `/api/events` and `/api/audit-log/sse`) |
+| `ophirpay_sse_dropped_events_total` | counter | — | SSE events shed by the bounded slow-consumer buffer (issue #744) |
+
+> **Slow consumers (issue #744).** A rising `ophirpay_sse_dropped_events_total`
+> with a flat `ophirpay_sse_open_connections` means connected clients cannot keep
+> up with the stream and their bounded buffers are shedding data. See
+> `docs/SSE.md` for the drop-oldest policy and the per-connection ceilings.
 
 Example scrape output:
 
@@ -36,6 +43,47 @@ ophirpay_endpoint_request_duration_seconds_sum{method="GET",endpoint="/api/payme
 ophirpay_endpoint_request_duration_seconds_count{method="GET",endpoint="/api/payments",status_class="2xx"} 12
 ophirpay_endpoint_errors_total{method="POST",endpoint="/api/payments",status_class="5xx"} 3
 ```
+
+## Authentication (required)
+
+`/api/metrics` exposes process memory, per-endpoint error rates and the live
+SSE connection count, so it is **no longer public**. Every scrape must present a
+credential; an unauthenticated request now returns `401` with **no metric body**:
+
+| Credential | Header | Notes |
+| --- | --- | --- |
+| Scrape token | `Authorization: Bearer <METRICS_TOKEN>` | Preferred. Constant-time comparison against the `METRICS_TOKEN` env var. |
+| API key | `Authorization: Bearer <key>` or `X-API-Key: <key>` | Must carry the `admin` scope (which implies every capability). |
+
+The endpoint **fails closed**: if `METRICS_TOKEN` is unset and the request
+carries no admin API key, the scrape gets `401`. Generate the token with
+`openssl rand -hex 32` and set it wherever the app runs. The response format is
+unchanged, so an existing scraper only needs the header:
+
+```bash
+curl -sS -H "Authorization: Bearer $METRICS_TOKEN" https://ophirpay.com/api/metrics
+```
+
+### Prometheus scrape config
+
+The Helm chart renders `METRICS_TOKEN` from `helm/ophirpay/values.yaml`
+(`secrets.METRICS_TOKEN`) into the `ophirpay-secrets` Secret. The
+`prometheus.io/*` pod annotations still advertise the path, but annotations
+cannot attach a header, so the scrape job must add the token itself:
+
+```yaml
+scrape_configs:
+  - job_name: ophirpay
+    metrics_path: /api/metrics
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/secrets/metrics-token  # value of METRICS_TOKEN
+    static_configs:
+      - targets: ["ophirpay.ophirpay.svc.cluster.local:80"]
+```
+
+For the Prometheus Operator, attach an `authorization` block (or a
+`secret`/`credentials` reference) to the `ServiceMonitor`/`PodMonitor` instead.
 
 ## Usage
 

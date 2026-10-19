@@ -280,11 +280,12 @@ export interface Refund {
 // ── Payment Event (Emitter Contract) ────────────────────────
 
 export interface PaymentEvent {
+  version: number;
   id: number;
   source: string;
   payer: string;
   payee: string;
-  amount: bigint;
+  amount: string;
   tx_hash: string;
   timestamp: number;
 }
@@ -344,6 +345,7 @@ export enum PaymentErrorCode {
   RefundWindowExpired = 50,
   AlreadyVoted = 51,
   ReentrantCall = 52,
+  PaymentIdempotencyConflict = 309,
 }
 
 export const PAYMENT_ERROR_MESSAGES: Record<number, string> = {
@@ -399,4 +401,5 @@ export const PAYMENT_ERROR_MESSAGES: Record<number, string> = {
   50: "Refund window has expired — no longer eligible",
   51: "Voter has already voted on this proposal",
   52: "Reentrant call detected — execution rejected by reentrancy lock",
+  309: "Idempotency key was reused for a different payment payload",
 };
