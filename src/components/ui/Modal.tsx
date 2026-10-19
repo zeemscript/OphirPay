@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: MIT
 
 
-import { useEffect, useRef, type ReactNode } from "react";
+import { useEffect, useId, useRef, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { cn } from "@/lib/utils";
+import { trapFocus } from "@/lib/focus-trap";
 
 interface ModalProps {
   open: boolean;
@@ -40,12 +41,29 @@ export function Modal({
 }: ModalProps) {
   const dialogRef = useRef<HTMLDivElement>(null);
 
+  // WAI-ARIA pattern: the dialog's accessible name should come from the
+  // rendered heading (aria-labelledby) rather than a duplicate aria-label.
+  // Screen readers then announce the heading's actual text, and any consumer
+  // that changes the title mid-open is reflected without a second attribute to
+  // keep in sync. `useId` keeps the ids unique when several dialogs mount.
+  const titleId = useId();
+  const descriptionId = useId();
+
   // Keep the latest `onClose` in a ref so the popstate listener below always
   // invokes the current handler without re-subscribing on every render.
   const onCloseRef = useRef(onClose);
   useEffect(() => {
     onCloseRef.current = onClose;
   }, [onClose]);
+
+  // title/description only decide where the focus trap starts when the dialog
+  // opens — read the latest values through a ref (same pattern as onCloseRef)
+  // so the trap effect below can stay keyed on `open` alone without focus
+  // churn when a caller changes the header mid-open.
+  const headerRef = useRef({ title, description });
+  useEffect(() => {
+    headerRef.current = { title, description };
+  });
 
   // Close the modal when the user presses the browser back button instead of
   // navigating away from the page. Opening the modal pushes a history entry;
@@ -73,15 +91,29 @@ export function Modal({
     };
   }, [open]);
 
-  // ESC to close + focus trap + body scroll lock + focus restore
+  // ESC to close + focus trap + body scroll lock + focus restore.
+  // Only depends on `open` — the close handler is read through `onCloseRef` so
+  // callers can pass a fresh `onClose` closure on every render (e.g. one that
+  // captures connection state) without tearing down this effect mid-open,
+  // which would briefly move focus back to the trigger (focus churn).
   useEffect(() => {
-    if (!open) return;
+    if (!open || !dialogRef.current) return;
 
-    const previouslyFocused = document.activeElement as HTMLElement | null;
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
 
+    // Moves focus into the dialog and restores it to the trigger element when
+    // released. Dialogs with a header (title/description + close control) put
+    // focus on the labelled region first so its name is announced; plain
+    // content dialogs move straight to the first interactive element.
+    const releaseTrap = trapFocus(dialogRef.current, {
+      focusContainer: Boolean(headerRef.current.title || headerRef.current.description),
+    });
+
+    // ESC to close
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
-        onClose();
+        onCloseRef.current();
         return;
       }
       if (e.key !== "Tab" || !dialogRef.current) return;
@@ -104,19 +136,12 @@ export function Modal({
     };
     document.addEventListener("keydown", onKeyDown);
 
-    const prevOverflow = document.body.style.overflow;
-    document.body.style.overflow = "hidden";
-
-    // Move focus into the dialog
-    requestAnimationFrame(() => dialogRef.current?.focus());
-
     return () => {
       document.removeEventListener("keydown", onKeyDown);
       document.body.style.overflow = prevOverflow;
-      // Restore focus to the element that opened the dialog
-      previouslyFocused?.focus();
+      releaseTrap();
     };
-  }, [open, onClose]);
+  }, [open]);
 
   // Guard against SSR — createPortal needs the client-side `document`
   if (!open || typeof document === "undefined") return null;
@@ -126,7 +151,11 @@ export function Modal({
       className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-6"
       role="dialog"
       aria-modal="true"
-      aria-label={title}
+      aria-labelledby={title ? titleId : undefined}
+      aria-describedby={description ? descriptionId : undefined}
+      // Fallback for a titleless dialog so it never reaches assistive tech as
+      // an unnamed `role="dialog"` (axe rule `aria-dialog-name`).
+      aria-label={title ? undefined : "Dialog"}
     >
       {/* Backdrop */}
       <div
@@ -151,12 +180,18 @@ export function Modal({
           <div className="flex items-start justify-between gap-4 px-6 pt-6 pb-4 border-b border-gray-100 dark:border-gray-800">
             <div>
               {title && (
-                <h2 className="text-lg font-semibold text-gray-900 dark:text-white">
+                <h2
+                  id={titleId}
+                  className="text-lg font-semibold text-gray-900 dark:text-white"
+                >
                   {title}
                 </h2>
               )}
               {description && (
-                <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
+                <p
+                  id={descriptionId}
+                  className="text-sm text-gray-500 dark:text-gray-400 mt-1"
+                >
                   {description}
                 </p>
               )}

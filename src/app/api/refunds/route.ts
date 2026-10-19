@@ -5,12 +5,14 @@ import prisma from "@/lib/prisma";
 import {
   successResponse,
   unauthorizedError,
+  conflictError,
   handleApiError,
 } from "@/lib/api-response";
 import { getAuthContext } from "@/lib/auth-session";
 import { verifyCsrf } from "@/lib/csrf";
 import { validateBody, createRefundRecordSchema } from "@/lib/validation-schemas";
 import { withRequestLogging } from "@/lib/request-logging";
+import { invalidateCache } from "@/lib/api-cache";
 
 export const GET = withMetrics("GET /api/refunds", withRequestLogging(async function GET(request: Request) {
   try {
@@ -25,13 +27,19 @@ export const GET = withMetrics("GET /api/refunds", withRequestLogging(async func
     const analytics = searchParams.get("analytics") === "true";
 
     if (analytics) {
+      const requestedDays = Number(searchParams.get("days") ?? 30);
+      const days = [7, 30, 90, 365].includes(requestedDays) ? requestedDays : 30;
+      const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
       const refunds = await prisma.refund.findMany({
         where: { userId: auth.userId },
-        select: { reasonCode: true },
+        orderBy: { requestedAt: "desc" },
+        take: 100,
+        select: { reasonCode: true, requestedAt: true },
       });
+      const inRange = refunds.filter((refund) => refund.requestedAt >= since);
       const buckets = [0, 1, 2, 3, 4, 5].map((code) => ({
         code,
-        count: refunds.filter((r) => r.reasonCode === code).length,
+        count: inRange.filter((refund) => refund.reasonCode === code).length,
       }));
       return successResponse(buckets);
     }
@@ -63,9 +71,9 @@ export const GET = withMetrics("GET /api/refunds", withRequestLogging(async func
 // ── POST /api/refunds ─────────────────────────────────────────
 
 /**
- * Persist a refund ledger row AFTER the on-chain request_refund succeeded.
- * The on-chain id (captured from the tx return value) is stored so the UI can
- * later target approve_refund / process_refund at the correct contract record.
+ * Persist a refund ledger row AFTER a successful on-chain request_refund.
+ * The on-chain id (captured from the tx return value) is stored so the
+ * Approve → Process flow can target the correct contract record.
  */
 export const POST = withMetrics("POST /api/refunds", withRequestLogging(async function POST(request: Request) {
   try {
@@ -79,17 +87,66 @@ export const POST = withMetrics("POST /api/refunds", withRequestLogging(async fu
     if (!parsed.success) return parsed.response;
 
     const { onChainId, ...data } = parsed.data;
-    const refund = await prisma.refund.create({
-      data: {
-        ...data,
-        paymentId: String(data.paymentId),
-        asset: data.asset === "native" || data.asset === "" ? "native" : data.asset,
-        onChainId: onChainId ?? null,
-        userId: auth.userId, // never trust a client-supplied userId
-      },
-    });
+    const paymentId = String(data.paymentId);
 
-    return successResponse(refund, undefined, 201);
+    // Idempotency guard (issue #365): at most one refund per payment.
+    // The pre-check turns the common duplicate-submission case into a clear
+    // 409 instead of a Prisma error.
+    const existing = await prisma.refund.findFirst({
+      where: { userId: auth.userId, paymentId },
+      select: { id: true, status: true },
+    });
+    if (existing) {
+      return conflictError(
+        `A refund for this payment already exists (refund ${existing.id}, status ${existing.status}). Duplicate submissions are rejected.`
+      );
+    }
+
+    try {
+      const refund = await prisma.refund.create({
+        data: {
+          ...data,
+          paymentId,
+          asset: data.asset === "native" || data.asset === "" ? "native" : data.asset,
+          onChainId: onChainId ?? null,
+          userId: auth.userId, // never trust a client-supplied userId
+        },
+      });
+
+      // Persisted audit trail entry so refund history is queryable via
+      // GET /api/audit-log?source=db|all (issue #365).
+      await prisma.auditLog.create({
+        data: {
+          action: "refund:create",
+          actor: auth.userId,
+          target: refund.id,
+          details: {
+            paymentId,
+            reasonCode: refund.reasonCode,
+            onChainId: refund.onChainId ?? null,
+            amount: refund.amount.toString(),
+          },
+        },
+      });
+
+      // Audit writes land in the persisted trail that /api/audit-log serves
+      // (#741) — drop the cached audit pages/entries so the next read is fresh.
+      await invalidateCache("audit-log");
+
+      return successResponse(refund, undefined, 201);
+    } catch (err) {
+      if (
+        err &&
+        typeof err === "object" &&
+        "code" in err &&
+        (err as { code?: string }).code === "P2002"
+      ) {
+        return conflictError(
+          "A refund for this payment already exists. Duplicate submissions are rejected."
+        );
+      }
+      throw err;
+    }
   } catch (err) {
     return handleApiError(err, "POST /api/refunds");
   }

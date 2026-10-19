@@ -5,7 +5,11 @@ import {
   Operation,
   Asset,
 } from "@stellar/stellar-sdk";
-import { getHorizonServer, NETWORK_PASSPHRASE } from "@/lib/stellar";
+import {
+  getHorizonServer,
+  NETWORK_PASSPHRASE,
+  resolveTransactionFee,
+} from "@/lib/stellar";
 
 interface SimulateResult {
   success: boolean;
@@ -23,13 +27,17 @@ export async function simulatePayment(params: {
   sourcePublicKey: string;
   destination: string;
   amount: string;
+  assetCode?: string;
+  assetIssuer?: string;
 }): Promise<SimulateResult> {
   try {
     const server = getHorizonServer();
     const sourceAccount = await server.loadAccount(params.sourcePublicKey);
 
     const now = Math.floor(Date.now() / 1000);
-    const baseFee = await server.fetchBaseFee();
+    // Use the same recommendation the signer will bake into the transaction,
+    // so the fee previewed here matches the fee submitted (issue #825).
+    const baseFee = await resolveTransactionFee(server);
 
     const tx = new TransactionBuilder(sourceAccount, {
       fee: baseFee.toString(),
@@ -39,7 +47,9 @@ export async function simulatePayment(params: {
       .addOperation(
         Operation.payment({
           destination: params.destination,
-          asset: Asset.native(),
+        asset: params.assetCode && params.assetCode !== "XLM"
+          ? new Asset(params.assetCode, params.assetIssuer!)
+          : Asset.native(),
           amount: params.amount,
         })
       )

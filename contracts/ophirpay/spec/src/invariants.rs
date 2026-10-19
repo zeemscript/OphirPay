@@ -1,4 +1,9 @@
-//! OphirPay Formal Verification — Kani Proof Harnesses
+//! OphirPay Kani proofs: modeled invariants plus a shared production predicate.
+//!
+//! > ⚠️ **Honest status:** Most harnesses verify hand-written models and do not
+//! > prove deployed-contract behavior. The spending-limit expiry harness also
+//! > verifies the pure predicate used by `check_spending` and `atomic_spend`;
+//! > it does not prove either entrypoint end to end. The harnesses run in CI.
 //!
 //! This file contains Kani-compatible proof harnesses for the 8 critical
 //! invariants identified in the OphirPay smart contract. Each harness uses
@@ -9,7 +14,7 @@
 //!
 //! ```bash
 //! cargo kani --harness <harness_name>
-//! cargo kani --harness all              # verify all invariants
+//! cargo kani --harness all              # verify all modeled invariants
 //! cargo kani --harness locked_balance   # verify just one
 //! ```
 //!
@@ -21,7 +26,7 @@
 //! cargo kani setup
 //! ```
 //!
-//! # Invariants Verified
+//! # Modeled Invariants (Not Proof of Deployed Contract)
 //!
 //! | # | Invariant | Harness |
 //! |---|-----------|---------|
@@ -34,7 +39,11 @@
 //! | 7 | Timelock delay of 24h is enforced | `timelock_delay_invariant` |
 //! | 8 | Spending limits enforce expiry | `spending_limit_expiry_invariant` |
 
+#[path = "../../src/spending_limit.rs"]
+mod spending_limit;
+
 use kani::proof;
+use spending_limit::is_spending_limit_expired;
 
 // ═══════════════════════════════════════════════════════════════
 // INVARIANT 1: LOCKED_BALANCE Protection
@@ -539,8 +548,8 @@ fn model_spending_limit_check(
         return false;
     }
 
-    // Expiry check: if expires_at > 0 and now >= expires_at → reject
-    if expires_at > 0 && now >= expires_at {
+    // This is the same expiry predicate called by the contract entrypoints.
+    if is_spending_limit_expired(expires_at, now) {
         return false;
     }
 
@@ -588,7 +597,11 @@ fn spending_limit_expiry_invariant() {
     }
 
     // Property 8b: expired limit always rejects
-    if is_active && expires_at > 0 && now >= expires_at {
+    assert_eq!(
+        is_spending_limit_expired(expires_at, now),
+        expires_at != 0 && now >= expires_at
+    );
+    if is_active && is_spending_limit_expired(expires_at, now) {
         assert!(!allowed);
     }
 
@@ -691,8 +704,13 @@ fn composite_locked_balance_and_deposit() {
 // ═══════════════════════════════════════════════════════════════
 // BONUS: No Overflow in compute_vested
 //
-// The linear vesting calculation uses checked_mul to prevent
-// overflow. On overflow, returns 0 (safe default).
+// The contract's linear vesting calculation is evaluated at 256-bit
+// precision (checked_mul fast path plus a quotient/remainder fallback),
+// so it never returns 0 for a partially vested stream and never exceeds
+// the stream total.
+//
+// The model below mirrors only the boundary branches — the widened
+// multiply path is not machine-checked here (see docs/AUDIT.md).
 // ═══════════════════════════════════════════════════════════════
 
 /// Prove that at boundary points, vesting behaves correctly.
