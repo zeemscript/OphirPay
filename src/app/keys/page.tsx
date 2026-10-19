@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: MIT
 
 import { useState, useEffect, useCallback } from "react";
+import { Breadcrumb } from "@/components/Breadcrumb";
+import { Card } from "@/components/ui/Card";
+import { LoadingSkeleton } from "@/components/LoadingSkeleton";
+import { useApiQuery, useApiMutation, type ApiError } from "@/hooks/useApiQuery";
 import {
   API_SCOPES,
   type ApiScope,
@@ -17,6 +21,24 @@ interface ApiKeyRecord {
   lastUsed: string | null;
   createdAt: string;
   expiresAt: string | null;
+  rotatedAt: string | null;
+  rotatedToId: string | null;
+}
+
+interface KeyUsage {
+  id: string;
+  name: string;
+  prefix: string;
+  lastUsed: string | null;
+  createdAt: string;
+  expiresAt: string | null;
+  total: number;
+  window: number;
+}
+
+interface KeyStatsResponse {
+  window: string;
+  keys: KeyUsage[];
 }
 
 const SCOPE_DESCRIPTIONS: Record<ApiScope, string> = {
@@ -25,6 +47,11 @@ const SCOPE_DESCRIPTIONS: Record<ApiScope, string> = {
   "read:analytics": "Read analytics and reporting data",
   admin: "Full access to all API capabilities",
 };
+
+function formatDate(value: string | null) {
+  if (!value) return "Never";
+  return new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(new Date(value));
+}
 
 export default function ApiKeysPage() {
   const toast = useToast();
@@ -36,10 +63,26 @@ export default function ApiKeysPage() {
   const [selectedScopes, setSelectedScopes] = useState<ApiScope[]>([]);
   const [creating, setCreating] = useState(false);
   const [newRawKey, setNewRawKey] = useState<string | null>(null);
+  const [rotatingId, setRotatingId] = useState<string | null>(null);
 
   // Edit panel
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editScopes, setEditScopes] = useState<ApiScope[]>([]);
+
+  // Usage-stats window
+  const [window, setWindow] = useState("30d");
+
+  const { data: usage, isLoading: usageLoading, error: usageError } = useApiQuery<KeyStatsResponse>(
+    ["api-keys", "stats", window],
+    `/api/keys/stats?window=${window}`
+  );
+  const rotateMutation = useApiMutation<
+    { id: string },
+    { key: string; previousKeyValidUntil: string }
+  >(
+    ({ id }) => `/api/keys/${encodeURIComponent(id)}/rotate`,
+    { invalidateKeys: [["api-keys", "stats", window]] },
+  );
 
   const loadKeys = useCallback(async () => {
     setLoading(true);
@@ -140,25 +183,77 @@ export default function ApiKeysPage() {
     }
   };
 
+  const handleRotate = async (key: ApiKeyRecord) => {
+    if (!globalThis.confirm(`Rotate "${key.name}"? The old key will remain valid for up to 24 hours.`)) {
+      return;
+    }
+    setRotatingId(key.id);
+    try {
+      const result = await rotateMutation.mutateAsync({ id: key.id });
+      setNewRawKey(result.key);
+      toast.success(
+        "API key rotated",
+        `The old key remains valid until ${formatDate(result.previousKeyValidUntil)}.`,
+      );
+      await loadKeys();
+    } catch (err) {
+      const apiErr = err as ApiError;
+      toast.error("Rotation failed", apiErr.message || "Please try again.");
+    } finally {
+      setRotatingId(null);
+    }
+  };
+
   const openEdit = (key: ApiKeyRecord) => {
     setEditingId(key.id);
     setEditScopes(key.scopes as ApiScope[]);
   };
 
   return (
-    <div className="max-w-4xl mx-auto mt-8 animate-fade-in px-4">
-      <div className="mb-6">
-        <h1 className="text-2xl font-bold text-gray-900 dark:text-white">
-          API Keys
-        </h1>
-        <p className="text-gray-500 dark:text-gray-400 mt-1">
-          Create keys with scoped permissions. Each key only grants the scopes
-          you select.
-        </p>
+    <div className="space-y-6 animate-fade-in">
+      <Breadcrumb items={[{ label: "API Keys" }]} />
+      <div className="flex flex-wrap items-end justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-bold text-gray-900 dark:text-white">API Keys</h1>
+          <p className="mt-1 text-gray-500 dark:text-gray-400">
+            Create keys with scoped permissions and monitor per-key request usage
+          </p>
+        </div>
+        <label className="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-300">
+          Window
+          <select value={window} onChange={(event) => setWindow(event.target.value)} className="rounded-lg border border-gray-200 bg-white px-3 py-2 dark:border-gray-700 dark:bg-gray-900">
+            <option value="24h">Last 24 hours</option>
+            <option value="7d">Last 7 days</option>
+            <option value="30d">Last 30 days</option>
+          </select>
+        </label>
       </div>
 
+      {/* Request usage */}
+      <Card padding="none">
+        {usageLoading ? <LoadingSkeleton variant="table" /> : usageError ? (
+          <div className="p-6 text-sm text-red-600 dark:text-red-400">Failed to load API key usage: {usageError.message}</div>
+        ) : usage?.keys.length ? (
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-sm">
+              <thead className="border-b border-gray-200 bg-gray-50 text-xs uppercase tracking-wide text-gray-500 dark:border-gray-800 dark:bg-gray-900/50 dark:text-gray-400">
+                <tr><th className="px-6 py-3 font-medium">Key</th><th className="px-6 py-3 font-medium">Requests ({usage.window})</th><th className="px-6 py-3 font-medium">All time</th><th className="px-6 py-3 font-medium">Last used</th></tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100 dark:divide-gray-800">
+                {usage.keys.map((key) => <tr key={key.id} className="text-gray-700 dark:text-gray-300">
+                  <td className="px-6 py-4"><div className="font-medium text-gray-900 dark:text-white">{key.name}</div><div className="font-mono text-xs text-gray-500">{key.prefix}...</div></td>
+                  <td className="px-6 py-4 font-semibold text-ophir-700 dark:text-ophir-400">{key.window.toLocaleString()}</td>
+                  <td className="px-6 py-4">{key.total.toLocaleString()}</td>
+                  <td className="px-6 py-4 whitespace-nowrap">{formatDate(key.lastUsed)}</td>
+                </tr>)}
+              </tbody>
+            </table>
+          </div>
+        ) : <div className="p-10 text-center text-sm text-gray-500 dark:text-gray-400">No API keys yet.</div>}
+      </Card>
+
       {/* Create card */}
-      <div className="bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-800 p-5 mb-6 space-y-4">
+      <div className="bg-white dark:bg-gray-900 rounded-xl border border-gray-200 dark:border-gray-800 p-5 space-y-4">
         <h2 className="text-lg font-semibold text-gray-900 dark:text-white">
           Create a new API key
         </h2>
@@ -225,7 +320,7 @@ export default function ApiKeysPage() {
         {newRawKey && (
           <div className="p-3 rounded-lg bg-green-50 dark:bg-green-950/30 border border-green-200 dark:border-green-800">
             <p className="text-sm text-green-700 dark:text-green-400 font-medium mb-2">
-              Key created — copy it now:
+              New key — copy it now:
             </p>
             <div className="flex items-center gap-2">
               <code className="flex-1 break-all text-xs font-mono text-gray-800 dark:text-gray-200 bg-white dark:bg-gray-900 p-2 rounded">
@@ -268,6 +363,11 @@ export default function ApiKeysPage() {
                         ? ` · last used ${new Date(key.lastUsed).toLocaleDateString()}`
                         : ""}
                     </p>
+                    {key.rotatedAt && (
+                      <p className="mt-1 text-xs text-amber-700 dark:text-amber-300">
+                        Rotated; old key valid until {formatDate(key.expiresAt)}.
+                      </p>
+                    )}
                     <div className="flex flex-wrap gap-1.5 mt-2">
                       {key.scopes.length === 0 ? (
                         <span className="px-2 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400">
@@ -286,12 +386,23 @@ export default function ApiKeysPage() {
                     </div>
                   </div>
                   <div className="flex gap-2 shrink-0">
-                    <button
-                      onClick={() => openEdit(key)}
-                      className="px-3 py-1.5 rounded-lg border border-gray-200 dark:border-gray-700 text-gray-700 dark:text-gray-300 text-xs font-medium hover:bg-gray-50 dark:hover:bg-gray-800"
-                    >
-                      Edit scopes
-                    </button>
+                    {!key.rotatedAt && (
+                      <>
+                        <button
+                          onClick={() => openEdit(key)}
+                          className="px-3 py-1.5 rounded-lg border border-gray-200 dark:border-gray-700 text-gray-700 dark:text-gray-300 text-xs font-medium hover:bg-gray-50 dark:hover:bg-gray-800"
+                        >
+                          Edit scopes
+                        </button>
+                        <button
+                          onClick={() => handleRotate(key)}
+                          disabled={rotatingId === key.id}
+                          className="px-3 py-1.5 rounded-lg border border-amber-200 dark:border-amber-800 text-amber-700 dark:text-amber-300 text-xs font-medium hover:bg-amber-50 dark:hover:bg-amber-950/30 disabled:opacity-50"
+                        >
+                          {rotatingId === key.id ? "Rotating..." : "Rotate"}
+                        </button>
+                      </>
+                    )}
                     <button
                       onClick={() => handleDelete(key.id)}
                       className="px-3 py-1.5 rounded-lg border border-red-200 dark:border-red-800 text-red-600 dark:text-red-400 text-xs font-medium hover:bg-red-50 dark:hover:bg-red-950/30"

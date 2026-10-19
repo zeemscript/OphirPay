@@ -11,6 +11,13 @@ info:
     - `X-API-Key: <api-key>`
     
     API keys are generated at `POST /api/keys` and shown only once.
+
+    **Conventions** — see [docs/API_GUIDE.md](./API_GUIDE.md) for the
+    endpoint conventions: file structure, Zod validation, error handling,
+    auth usage, the response envelope, and rate limiting.
+
+    **Error codes** — see [docs/API_ERRORS.md](./API_ERRORS.md) for the
+    declared status and typical condition for each catalog code.
   version: 0.1.0
   contact:
     name: OphirPay Team
@@ -75,6 +82,8 @@ tags:
     description: Contract deployment info and version
   - name: Stats
     description: Aggregate on-chain contract statistics
+  - name: Assets
+    description: Asset metadata resolved from the issuer's SEP-1 TOML
   - name: Session
     description: Wallet session issuance and revocation
 
@@ -84,6 +93,22 @@ paths:
     get:
       tags: [Payments]
       summary: List payments
+      description: |
+        Lists the authenticated user's payments, newest first
+        (`createdAt DESC, id DESC`).
+
+        Two pagination modes:
+
+        - **Keyset (default)** — pass `limit` and, for subsequent pages, the
+          opaque `cursor` returned in `meta.nextCursor`. Rows are fetched with
+          `take = limit + 1` to compute `hasMore`, so deep pages cost O(limit)
+          and ordering is stable under concurrent inserts. Set
+          `includeTotal=true` to also get `meta.total` (an expensive COUNT —
+          opt in only when you need it).
+        - **Offset (legacy)** — pass `page` + `limit` to get `meta` with
+          `page`, `limit`, `total`, `totalPages`, `hasNext`, `hasPrev`.
+
+        `cursor` and `page` are mutually exclusive (400 if both provided).
       parameters:
         - name: page
           in: query
@@ -115,11 +140,24 @@ paths:
             the authenticated user — soft-deleted rows are hidden by default.
       responses:
         "200":
-          description: Paginated payment list
+          description: Paginated payment list (keyset or offset mode)
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/PaginatedPayments"
+        "400":
+          description: >-
+            RFC 7807 problem details — a filter or cursor failed validation.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "401":
+          description: RFC 7807 problem details — no authenticated caller.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
     post:
       tags: [Payments]
       summary: Create a payment
@@ -129,17 +167,66 @@ paths:
           application/json:
             schema:
               $ref: "#/components/schemas/CreatePaymentRequest"
+            examples:
+              validPayment:
+                summary: Create a 125 XLM payment
+                value:
+                  amount: 125
+                  sourceAccountId: GACZ7ZELCUC5YGJ6JHIVLEZNR3XKYKOVUWD6H3IRFPRZMALNUYJZQM2U
+                  destAddress: GACNKEDGJYLLVQDXWYEEPB47Y3JEV5JNZ3RQANTJIVKKEOXX4NC4YWHU
+                  assetCode: XLM
+                  description: September invoice 1042
+                  memo: INV-1042
       responses:
         "201":
           description: Payment created
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/PaymentResponse"
+                $ref: "#/components/schemas/PaymentEnvelopeResponse"
+              examples:
+                createdPayment:
+                  summary: Payment created and awaiting submission
+                  value:
+                    success: true
+                    data:
+                      id: cmf4k2q8p0001x9a2b3c4d5e6
+                      amount: 125
+                      assetCode: XLM
+                      assetIssuer: null
+                      description: September invoice 1042
+                      memo: INV-1042
+                      status: CREATED
+                      transactionHash: null
+                      idempotencyKey: 42ce12b8-4d15-4a34-8f52-7b2136a84462
+                      sourceAccountId: GACZ7ZELCUC5YGJ6JHIVLEZNR3XKYKOVUWD6H3IRFPRZMALNUYJZQM2U
+                      userId: seed-user-1
+                      batchId: null
+                      createdAt: "2026-09-29T10:00:00.000Z"
+                      completedAt: null
+                      errorMessage: null
+                    meta:
+                      timestamp: "2026-09-29T10:00:00.000Z"
         "400":
-          $ref: "#/components/responses/ValidationError"
+          description: >-
+            RFC 7807 problem details. Zod rejections carry one `errors[]` entry
+            per invalid field (including an oversized or badly encoded memo).
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "401":
+          description: RFC 7807 problem details — no authenticated caller.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
         "500":
-          $ref: "#/components/responses/ServerError"
+          description: RFC 7807 problem details — an unexpected server failure.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
 
   /api/payments/{id}:
     get:
@@ -157,7 +244,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/PaymentResponse"
+                $ref: "#/components/schemas/PaymentEnvelopeResponse"
         "404":
           $ref: "#/components/responses/NotFound"
     patch:
@@ -232,17 +319,128 @@ paths:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/PaymentResponse"
+                $ref: "#/components/schemas/PaymentEnvelopeResponse"
         "400":
-          $ref: "#/components/responses/ValidationError"
-        "404":
-          $ref: "#/components/responses/NotFound"
-        "409":
-          description: Payment is not in a retryable (FAILED) state
+          description: RFC 7807 problem details — the body failed validation.
           content:
-            application/json:
+            application/problem+json:
               schema:
-                $ref: "#/components/schemas/ErrorResponse"
+                $ref: "#/components/schemas/ProblemDetails"
+        "401":
+          description: RFC 7807 problem details — no authenticated caller.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "404":
+          description: RFC 7807 problem details — no such payment for this caller.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "409":
+          description: >-
+            RFC 7807 problem details — the payment is not in a retryable
+            (FAILED) state. `code` is `STATE_CONFLICT`.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+
+  /api/payments/cancel:
+    post:
+      tags: [Payments]
+      summary: Cancel a payment
+      description: |
+        Soft-cancels a payment by transaction hash: the row is flipped to
+        CANCELLED so the UI can reflect the status change while the chain
+        confirms. Scoped to the authenticated user's own payments.
+      security: [{ ApiKeyAuth: [] }, { BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [txHash]
+              properties:
+                txHash:
+                  type: string
+                  description: Transaction hash of the payment to cancel
+      responses:
+        "200":
+          description: Payment cancelled
+        "400":
+          description: RFC 7807 problem details — `txHash` is missing or invalid.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "401":
+          description: RFC 7807 problem details — no authenticated caller.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "404":
+          description: RFC 7807 problem details — no such payment for this caller.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+
+  /api/payments/export:
+    get:
+      tags: [Payments]
+      summary: Export payments as CSV
+      description: |
+        Server-side CSV export of the CURRENT filter results — every row
+        matching `status` / `search` (the same filters as GET /api/payments),
+        not just the page loaded in the browser. Returns a dated CSV
+        attachment that includes all key fields plus memo and transaction hash.
+
+        The response is **streamed**: the CSV header is sent immediately, then
+        rows are flushed in 250-row chunks as they are pulled from the database
+        with a Prisma cursor (`Transfer-Encoding: chunked`). Memory use is flat
+        regardless of how many rows match, and there is no row cap — the export
+        never silently omits rows. If the database fails after the headers are
+        sent, the stream is errored so the download fails instead of producing
+        a truncated file that looks complete.
+      security: [{ ApiKeyAuth: [] }, { BearerAuth: [] }]
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Only export payments with this status
+        - name: search
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Only export payments matching this search term
+      responses:
+        "200":
+          description: >-
+            Streamed CSV attachment with the matching payment rows
+            (`Transfer-Encoding: chunked`).
+          content:
+            text/csv:
+              schema:
+                type: string
+        "400":
+          description: RFC 7807 problem details — an unknown `status` filter.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "401":
+          description: RFC 7807 problem details — no authenticated caller.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
 
   # ── Escrows ───────────────────────────────────────────────
   /api/escrows:
@@ -395,6 +593,37 @@ paths:
           description: Role assignment(s)
         "401":
           $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [RBAC]
+      summary: Authorize a role change (sudo step-up)
+      description: >
+        Server-side step-up gate for role grants and revocations (issue #1389).
+        The on-chain write is performed by the connected wallet, but it must be
+        authorized here first. Returns 403 SUDO_REQUIRED with a wallet challenge
+        when the session's last cryptographic verification is older than 15
+        minutes; retry with the signed challenge to authorize the mutation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action, address]
+              properties:
+                action: { type: string, enum: [grant, revoke] }
+                address: { type: string, description: "Stellar account address (G…, 56 characters)" }
+                role: { type: integer, minimum: 0, maximum: 2, description: "0 Admin, 1 Operator, 2 Auditor; required for grant" }
+                challenge: { type: string, description: "Step-up challenge, present only on the retry" }
+                signature: { type: string, description: "Wallet signature over the challenge message, present only on the retry" }
+      responses:
+        "200":
+          description: Action authorized
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
 
   # ── Fee Config ────────────────────────────────────────────
   /api/fee-config:
@@ -407,6 +636,42 @@ paths:
           description: Fee configuration
         "401":
           $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [Fee Config]
+      summary: Authorize a fee-configuration change (sudo step-up)
+      description: >
+        Server-side step-up gate for fee-config changes (issue #1389). The
+        on-chain write is performed by the connected wallet, but it must be
+        authorized here first. Returns 403 SUDO_REQUIRED with a wallet challenge
+        when the session's last cryptographic verification is older than 15
+        minutes; retry with the signed challenge to authorize the mutation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [action]
+              properties:
+                action: { type: string, enum: [set_fee_config, set_fee_collector] }
+                paymentFeeBps: { type: integer, minimum: 0, maximum: 1000 }
+                escrowFeeBps: { type: integer, minimum: 0, maximum: 1000 }
+                streamFeeBps: { type: integer, minimum: 0, maximum: 1000 }
+                batchBaseFee: { type: integer, minimum: 0 }
+                batchPerItemFee: { type: integer, minimum: 0 }
+                enabled: { type: boolean }
+                collector: { type: string, description: "Fee collector address; required for set_fee_collector" }
+                challenge: { type: string, description: "Step-up challenge, present only on the retry" }
+                signature: { type: string, description: "Wallet signature over the challenge message, present only on the retry" }
+      responses:
+        "200":
+          description: Action authorized
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
 
   /api/fee-config/collector:
     get:
@@ -466,6 +731,45 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
 
+  # ── Assets ────────────────────────────────────────────────
+  /api/assets/metadata:
+    get:
+      tags: [Assets]
+      summary: Resolve asset metadata from the issuer's SEP-1 TOML
+      description: |
+        Looks up the issuer account's `home_domain` on Horizon, fetches and
+        validates that domain's `stellar.toml` (shared timeout + 100 KiB size
+        limit, DNS/URL safety guard), and returns the matching `[[CURRENCIES]]`
+        entry so custom assets can display a ticker and issuer name.
+
+        Results are cached per issuer domain for `ASSET_METADATA_TTL_MS`.
+        Unknown or unreachable metadata degrades to `code` plus `issuer` with
+        `name: null` and `source: fallback` — never an error (issue #824).
+      parameters:
+        - name: code
+          in: query
+          required: true
+          schema: { type: string, maxLength: 12 }
+          description: Asset code (e.g. USDC)
+        - name: issuer
+          in: query
+          required: true
+          schema: { type: string, pattern: "^G[A-Z0-9]{55}$" }
+          description: Stellar account that issues the asset
+      responses:
+        "200":
+          description: Resolved asset metadata (or a fallback code + issuer)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, const: true }
+                  data:
+                    $ref: "#/components/schemas/AssetMetadata"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+
   # ── Batches ────────────────────────────────────────────────
   /api/batches:
     get:
@@ -504,21 +808,112 @@ paths:
           $ref: "#/components/responses/Unauthorized"
     post:
       tags: [Batches]
-      summary: Create a batch payment
+      summary: Create a batch payment (idempotent)
       security: [{ ApiKeyAuth: [] }, { BearerAuth: [] }]
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema: { type: string, minLength: 8, maxLength: 255 }
+          description: >-
+            Per-user key that makes submission idempotent. Re-sending the same
+            key returns the already-created batch (200) instead of double
+            sending; if the first attempt crashed before inserting child
+            payments, a retry resumes only the missing ones. An equivalent
+            `idempotencyKey` body field is accepted when no header is sent, but
+            the header takes precedence.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               $ref: "#/components/schemas/CreateBatchRequest"
+            examples:
+              validBatch:
+                summary: Two-recipient XLM payroll batch
+                value:
+                  name: September payroll
+                  description: September payroll payouts
+                  sourceAccountId: GACZ7ZELCUC5YGJ6JHIVLEZNR3XKYKOVUWD6H3IRFPRZMALNUYJZQM2U
+                  idempotencyKey: september-payroll-2026
+                  recipients:
+                    - address: GACNKEDGJYLLVQDXWYEEPB47Y3JEV5JNZ3RQANTJIVKKEOXX4NC4YWHU
+                      amount: 3200
+                      assetCode: XLM
+                      memo: PAYROLL-001
+                    - address: GA5AZNWWOW5PXPNHBVRJOB2ZPZO3PXN5VTXTXOIJTACZZHE5ZA7CAH7H
+                      amount: 2850
+                      assetCode: XLM
+                      memo: PAYROLL-002
       responses:
+        "200":
+          description: Already-processed batch returned for a replayed idempotency key (meta.deduplicated is true)
         "201":
           description: Batch created with child payments
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, const: true }
+                  data:
+                    $ref: "#/components/schemas/BatchResponse"
+                  meta:
+                    type: object
+                    properties:
+                      timestamp: { type: string, format: date-time }
+              examples:
+                createdBatch:
+                  summary: Batch created with two child payments
+                  value:
+                    success: true
+                    data:
+                      id: cmf4k2q8p0002x9a2b3c4d5e7
+                      userId: seed-user-1
+                      name: September payroll
+                      description: September payroll payouts
+                      status: CREATED
+                      createdAt: "2026-09-29T10:00:00.000Z"
+                      updatedAt: "2026-09-29T10:00:00.000Z"
+                      payments:
+                        - id: cmf4k2q8p0003x9a2b3c4d5e8
+                          amount: 3200
+                          assetCode: XLM
+                          assetIssuer: null
+                          description: null
+                          memo: PAYROLL-001
+                          status: CREATED
+                          transactionHash: null
+                          idempotencyKey: 756580f6-82db-4a72-bbd8-0a12792f11a9
+                          sourceAccountId: GACZ7ZELCUC5YGJ6JHIVLEZNR3XKYKOVUWD6H3IRFPRZMALNUYJZQM2U
+                          userId: seed-user-1
+                          batchId: cmf4k2q8p0002x9a2b3c4d5e7
+                          createdAt: "2026-09-29T10:00:00.000Z"
+                          completedAt: null
+                          errorMessage: null
+                        - id: cmf4k2q8p0004x9a2b3c4d5e9
+                          amount: 2850
+                          assetCode: XLM
+                          assetIssuer: null
+                          description: null
+                          memo: PAYROLL-002
+                          status: CREATED
+                          transactionHash: null
+                          idempotencyKey: 07682f53-1b06-4eb0-9c8f-6a8c5b4e4d9a
+                          sourceAccountId: GACZ7ZELCUC5YGJ6JHIVLEZNR3XKYKOVUWD6H3IRFPRZMALNUYJZQM2U
+                          userId: seed-user-1
+                          batchId: cmf4k2q8p0002x9a2b3c4d5e7
+                          createdAt: "2026-09-29T10:00:00.000Z"
+                          completedAt: null
+                          errorMessage: null
+                    meta:
+                      timestamp: "2026-09-29T10:00:00.000Z"
         "400":
           $ref: "#/components/responses/ValidationError"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
 
   /api/batches/{id}:
     get:
@@ -534,6 +929,50 @@ paths:
           description: Batch details with child payments
         "404":
           $ref: "#/components/responses/NotFound"
+    post:
+      tags: [Batches]
+      summary: Bulk-cancel a batch's PENDING payments
+      security: [{ ApiKeyAuth: [] }, { BearerAuth: [] }]
+      description: >
+        Cancels all PENDING payments of the batch in one request. Payments that
+        have already been submitted (any non-PENDING status) are left untouched
+        and reported via `skipped`, so callers see exactly what changed.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Counts of cancelled / skipped / total payments
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BulkCancelBatchResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/batches/summary:
+    get:
+      tags: [Batches]
+      summary: Batch status summary for the authenticated user
+      description: |
+        Per-status counts of the user's batches with optional drill-down into
+        the newest batch of each status (including per-payment progress
+        counts). Useful for dashboard badges.
+      security: [{ ApiKeyAuth: [] }, { BearerAuth: [] }]
+      parameters:
+        - name: drillDown
+          in: query
+          schema: { type: boolean, default: false }
+          description: Include the newest batch per status with payment counts
+      responses:
+        "200":
+          description: Per-status batch counts (with optional drill-down)
+        "401":
+          $ref: "#/components/responses/Unauthorized"
 
   # ── Recurring Payments ────────────────────────────────────
   /api/recurring:
@@ -564,6 +1003,32 @@ paths:
           description: Recurrence created
         "400":
           $ref: "#/components/responses/ValidationError"
+    patch:
+      tags: [Recurring]
+      summary: Pause or resume a recurring payment
+      security: [{ ApiKeyAuth: [] }, { BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [id, paused]
+              properties:
+                id:
+                  type: string
+                paused:
+                  type: boolean
+                  description: true pauses the schedule, false resumes it
+      responses:
+        "200":
+          description: Recurrence updated
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: Recurrence not found
 
   /api/recurring/{id}:
     get:
@@ -579,6 +1044,126 @@ paths:
           description: Recurrence details
         "404":
           $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [Recurring]
+      summary: Cancel (deactivate) a recurring payment
+      description: |
+        Deactivates the schedule so the scheduler stops firing it, preserving
+        its run history. Scoped to the authenticated user's own schedules.
+      security: [{ ApiKeyAuth: [] }, { BearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Recurrence deactivated
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # ── Scheduled Payments ────────────────────────────────────
+  /api/scheduled:
+    get:
+      tags: [Scheduled Payments]
+      summary: List scheduled payments (soonest first)
+      security: [{ ApiKeyAuth: [] }, { BearerAuth: [] }]
+      parameters:
+        - name: page
+          in: query
+          schema: { type: integer, default: 1 }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        "200":
+          description: Paginated scheduled payments
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      tags: [Scheduled Payments]
+      summary: Create a scheduled payment
+      security: [{ ApiKeyAuth: [] }, { BearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount, assetCode, destAddress, scheduledAt]
+              properties:
+                amount:
+                  type: number
+                  exclusiveMinimum: 0
+                assetCode:
+                  type: string
+                  default: XLM
+                assetIssuer:
+                  type: string
+                destAddress:
+                  type: string
+                  pattern: "^G[A-Z0-9]{55}$"
+                memo:
+                  type: string
+                  maxLength: 28
+                scheduledAt:
+                  type: string
+                  format: date-time
+                  description: Must be in the future
+      responses:
+        "201":
+          description: Scheduled payment created
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    delete:
+      tags: [Scheduled Payments]
+      summary: Cancel a scheduled payment that has not executed
+      security: [{ ApiKeyAuth: [] }, { BearerAuth: [] }]
+      parameters:
+        - name: id
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Scheduled payment cancelled
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/scheduled/run:
+    get:
+      tags: [Scheduled Payments]
+      summary: Trigger the scheduled-payment sweep (cron ping)
+      description: |
+        Executes due scheduled payments. Invoked by Vercel Cron with the
+        `CRON_SECRET` as a Bearer token or `x-cron-secret` header; usable for
+        manual triggering with the same secret.
+      responses:
+        "200":
+          description: Run summary (picked / executed / failed / skipped)
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          description: Scheduler not configured (missing secrets)
+    post:
+      tags: [Scheduled Payments]
+      summary: Trigger the scheduled-payment sweep manually
+      description: Same run as GET, for external schedulers and manual triggering.
+      responses:
+        "200":
+          description: Run summary (picked / executed / failed / skipped)
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          description: Scheduler not configured (missing secrets)
 
   # ── Payment Requests ──────────────────────────────────────
   /api/requests:
@@ -602,6 +1187,62 @@ paths:
           description: Payment request created
         "400":
           $ref: "#/components/responses/ValidationError"
+  /api/requests/{id}/paid:
+    post:
+      tags: [Payment Requests]
+      summary: Confirm payment for a payment request
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [transactionHash]
+              properties:
+                transactionHash: { type: string }
+      responses:
+        "200":
+          description: Payment request marked as paid
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/requests/{id}/remind:
+    post:
+      tags: [Payment Requests]
+      summary: Email a reminder for a payment request
+      security: [{ ApiKeyAuth: [] }, { BearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Reminder email sent
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/requests/expire:
+    get:
+      tags: [Payment Requests]
+      summary: Expire overdue payment requests
+      description: Invoked by the scheduled job with the configured cron secret.
+      responses:
+        "200":
+          description: Number of payment requests expired
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          description: Expiry scheduler is not configured
 
   # ── Webhooks ──────────────────────────────────────────────
   /api/webhooks:
@@ -631,6 +1272,26 @@ paths:
           $ref: "#/components/responses/ValidationError"
         "401":
           $ref: "#/components/responses/Unauthorized"
+    patch:
+      tags: [Webhooks]
+      summary: Rotate a webhook signing secret
+      description: >
+        Generates a new HMAC-SHA256 signing secret and revokes the previous
+        one immediately — the next delivery is signed with the new secret.
+        The new secret is returned exactly once.
+      security: [{ ApiKeyAuth: [] }, { BearerAuth: [] }]
+      parameters:
+        - name: id
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Secret rotated (new secret returned once)
+        "400":
+          description: Missing webhook ID or webhook not found
+        "401":
+          $ref: "#/components/responses/Unauthorized"
     delete:
       tags: [Webhooks]
       summary: Delete a webhook
@@ -648,6 +1309,178 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
 
+  /api/webhooks/{id}:
+    get:
+      tags: [Webhooks]
+      summary: Get a single webhook (secret redacted)
+      security: [{ ApiKeyAuth: [] }, { BearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Webhook details (signing secret redacted)
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/webhooks/{id}/test:
+    get:
+      tags: [Webhooks]
+      summary: Preview a signed webhook test request
+      security: [{ ApiKeyAuth: [] }, { BearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: event
+          in: query
+          schema: { type: string }
+        - name: timestamp
+          in: query
+          schema: { type: string, format: date-time }
+      responses:
+        "200":
+          description: Exact canonical body, wire body, headers, and validated target URL
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    post:
+      tags: [Webhooks]
+      summary: Send a test webhook delivery
+      security: [{ ApiKeyAuth: [] }, { BearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Test event delivered
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/webhooks/{id}/replay:
+    post:
+      tags: [Webhooks]
+      summary: Replay stored webhook events within a bounded date range
+      description: |
+        Re-delivers stored events from the last 7 days (max 100 per request).
+        Each replay attempt is recorded as a delivery for dashboard visibility.
+      security: [{ ApiKeyAuth: [] }, { BearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                since:
+                  type: string
+                  format: date-time
+                  description: Start of replay window (clamped to last 7 days)
+                until:
+                  type: string
+                  format: date-time
+                  description: End of replay window (defaults to now)
+                limit:
+                  type: integer
+                  minimum: 1
+                  maximum: 100
+                  description: Max events to replay (default 50)
+      responses:
+        "200":
+          description: Replay summary with delivery counts
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/webhooks/{id}/deliveries:
+    get:
+      tags: [Webhooks]
+      summary: List delivery history for a webhook
+      security: [{ ApiKeyAuth: [] }, { BearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        "200":
+          description: Delivery history (original + replay attempts)
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/webhooks/{id}/deliveries/{deliveryId}:
+    get:
+      tags: [Webhooks]
+      summary: Get a webhook delivery record
+      security: [{ ApiKeyAuth: [] }, { BearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: deliveryId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Full webhook delivery record, including request preview and response body
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /api/webhooks/{id}/deliveries/{deliveryId}/redeliver:
+    post:
+      tags: [Webhooks]
+      summary: Redeliver a webhook payload from a prior delivery
+      description: |
+        Re-sends the stored payload from the original event associated with a
+        prior delivery and records a new delivery row for dashboard
+        visibility.
+      security: [{ ApiKeyAuth: [] }, { BearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string }
+        - name: deliveryId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: New delivery recorded and attempted
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
   # ── API Keys ──────────────────────────────────────────────
   /api/keys:
     get:
@@ -662,6 +1495,14 @@ paths:
     post:
       tags: [API Keys]
       summary: Generate a new API key (raw key shown once)
+      description: |
+        Creates a key for the authenticated account and returns the raw value
+        exactly once. The account may hold at most five active keys; creation
+        is refused with 409 once the cap is reached.
+
+        Create and rotate share a sliding quota of 10 operations per account
+        per hour, beyond which the endpoint returns 429. Successful creation is
+        recorded in the audit log as `api_key:create`.
       security: [{ ApiKeyAuth: [] }, { BearerAuth: [] }]
       requestBody:
         required: true
@@ -710,6 +1551,28 @@ paths:
                         description: Raw API key — shown only once
         "400":
           $ref: "#/components/responses/ValidationError"
+        "409":
+          description: >
+            The account already holds the maximum number of active API keys
+            (5). Revoke or rotate an existing key before creating another.
+        "429":
+          description: >
+            Hourly API-key create/rotate quota exhausted (10 operations per
+            account per hour). `Retry-After` and `error.details.resetAt` carry
+            the reset time.
+          headers:
+            Retry-After:
+              schema: { type: integer }
+            X-RateLimit-Limit:
+              schema: { type: integer }
+            X-RateLimit-Remaining:
+              schema: { type: integer }
+            X-RateLimit-Reset:
+              schema: { type: integer }
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
     patch:
       tags: [API Keys]
       summary: Update the scopes of an existing API key
@@ -754,6 +1617,107 @@ paths:
         "400":
           description: Missing key ID
 
+  /api/keys/{id}/rotate:
+    post:
+      tags: [API Keys]
+      summary: Rotate an API key with a 24-hour overlap
+      description: |
+        Atomically issues a replacement key for `id` and gives the previous key
+        a 24-hour overlap (never extending its own expiry), so consumers can
+        deploy the new credential without an authentication outage.
+
+        The previous key keeps working until `previousKeyValidUntil`; after
+        that it is rejected. Rotating an already-rotated, revoked, expired, or
+        unknown key returns 400 rather than minting a second replacement, and
+        the rotation is recorded in the audit log as `api_key:rotate`,
+        including `details.initiatedBy` (the wallet or API key that requested
+        it).
+
+        Rotation shares the create quota: 10 create/rotate operations per
+        account per hour, after which the endpoint returns 429.
+      security: [{ ApiKeyAuth: [] }, { BearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: API key ID to rotate
+          schema: { type: string }
+      responses:
+        "201":
+          description: Replacement key issued — store its raw `key` immediately
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, const: true }
+                  data:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                        description: ID of the replacement key
+                      name: { type: string }
+                      prefix: { type: string }
+                      scopes:
+                        type: array
+                        items: { type: string }
+                      key:
+                        type: string
+                        description: Raw replacement API key — shown only once
+                      previousPrefix: { type: string }
+                      previousKeyValidUntil:
+                        type: string
+                        format: date-time
+                        description: >
+                          End of the overlap window, after which the previous
+                          key stops authenticating
+        "400":
+          description: Key not found, expired, or already rotated
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          description: >
+            Hourly API-key create/rotate quota exhausted. `Retry-After` and
+            `error.details.resetAt` carry the reset time.
+          headers:
+            Retry-After:
+              schema: { type: integer }
+            X-RateLimit-Limit:
+              schema: { type: integer }
+            X-RateLimit-Remaining:
+              schema: { type: integer }
+            X-RateLimit-Reset:
+              schema: { type: integer }
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          $ref: "#/components/responses/ServerError"
+
+  /api/keys/stats:
+    get:
+      tags: [API Keys]
+      summary: API key usage statistics
+      description: |
+        Aggregated request counts per API key over the chosen window
+        (24h / 7d / 30d), alongside each key's metadata and last-used time.
+      security: [{ ApiKeyAuth: [] }, { BearerAuth: [] }]
+      parameters:
+        - name: window
+          in: query
+          schema: { type: string, enum: [24h, 7d, 30d], default: 30d }
+      responses:
+        "200":
+          description: Per-key usage stats for the window
+        "400":
+          description: Window must be 24h, 7d, or 30d
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
   # ── Session ───────────────────────────────────────────────
   /api/auth/session:
     post:
@@ -783,6 +1747,43 @@ paths:
       responses:
         "200":
           description: Session revoked
+
+  /api/auth/challenge:
+    get:
+      tags: [Session]
+      summary: Mint a proof-of-ownership challenge for a wallet
+      description: |
+        Returns a short-lived, server-signed challenge plus the exact message
+        the wallet must sign. `POST /api/auth/session` only issues a session
+        cookie when the signature over this message verifies against the
+        public key.
+      parameters:
+        - name: publicKey
+          in: query
+          required: true
+          schema:
+            type: string
+            description: Stellar wallet public key (G...)
+      responses:
+        "200":
+          description: Challenge minted
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [challenge, message, expiresIn]
+                properties:
+                  challenge:
+                    type: string
+                    description: Single-use challenge token
+                  message:
+                    type: string
+                    description: Exact message the wallet must sign
+                  expiresIn:
+                    type: integer
+                    description: Challenge lifetime in seconds
+        "400":
+          description: Invalid or missing public key
 
   /api/csrf:
     get:
@@ -960,6 +1961,53 @@ paths:
       responses:
         "201":
           description: Proposal created
+
+  /api/governance/proposals/{id}:
+    get:
+      tags: [Governance]
+      summary: Fetch one governance proposal with its vote history
+      description: |
+        Reads a single proposal from the chain together with the governance
+        config and the recorded vote events, so the proposal detail page can
+        render in one round trip.
+      security: [{ ApiKeyAuth: [] }, { BearerAuth: [] }]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: integer, minimum: 1 }
+          description: On-chain proposal id
+      responses:
+        "200":
+          description: Proposal detail with config and vote history
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean, const: true }
+                  data:
+                    type: object
+                    properties:
+                      proposal:
+                        description: Raw return value of the contract's get_proposal
+                      config:
+                        description: Governance config, null when its simulation failed
+                      voteHistory:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            voter: { type: [string, "null"] }
+                            support: { type: [boolean, "null"] }
+                            transactionHash: { type: [string, "null"] }
+                            recordedAt: { type: string, format: date-time }
+        "400":
+          description: Proposal id is not a positive integer
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
 
   /api/governance/vote:
     post:
@@ -1181,29 +2229,54 @@ paths:
     get:
       tags: [Audit Log]
       summary: Query contract audit log
+      description: |
+        Offset-paginated audit log with combined, server-side applied filters
+        (`actor`, `action`, `resource`, `since`/`until` date range) and stable
+        ordering (newest first by default). `total` reflects the filtered set.
       security: [{ ApiKeyAuth: [] }, { BearerAuth: [] }]
       parameters:
         - name: page
           in: query
-          schema: { type: integer, default: 1 }
+          schema: { type: integer, minimum: 1, default: 1 }
         - name: limit
           in: query
           schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
         - name: actor
           in: query
           schema: { type: string }
-          description: Filter by Stellar address
+          description: >
+            Filter by Stellar address (substring match, case-insensitive).
+            Combine with `action`, `since`, and `until`; all filters compose
+            with `page`/`limit` pagination.
         - name: action
           in: query
           schema: { type: string }
-          description: Filter by action type
-        - name: since
+          description: Filter by exact action type (e.g. `payment_recorded`)
+        - name: resource
           in: query
           schema: { type: integer }
-          description: Unix timestamp filter
+          description: Filter by the affected entity id (matches target_id)
+        - name: since
+          in: query
+          schema: { type: string }
+          description: Inclusive start of the date range — Unix seconds or ISO 8601
+        - name: until
+          in: query
+          schema: { type: string }
+          description: Inclusive end of the date range — Unix seconds or ISO 8601
+        - name: order
+          in: query
+          schema: { type: string, enum: [asc, desc], default: desc }
+          description: Result ordering by entry id (newest first by default)
+        - name: source
+          in: query
+          schema: { type: string, enum: [contract, db, all], default: contract }
+          description: Backing store — on-chain ledger, persisted audit trail, or both
       responses:
         "200":
-          description: Paginated audit log entries
+          description: >
+            Paginated audit log entries. Response `meta.total` reflects the
+            filtered result set, so pagination composes with filters.
         "401":
           $ref: "#/components/responses/Unauthorized"
 
@@ -1222,6 +2295,46 @@ paths:
             text/event-stream:
               schema:
                 type: string
+
+  /api/audit-log/export:
+    get:
+      tags: [Audit Log]
+      summary: Export contract audit log to CSV
+      description: |
+        Streaming CSV download of the audit log applying the same filters as
+        GET /api/audit-log. Rows are streamed chunk-by-chunk from the contract,
+        so the full result set is never held in memory.
+      security: [{ ApiKeyAuth: [] }, { BearerAuth: [] }]
+      parameters:
+        - name: actor
+          in: query
+          schema: { type: string }
+          description: Filter by exact Stellar actor address
+        - name: action
+          in: query
+          schema: { type: string }
+          description: Filter by exact action type
+        - name: resource
+          in: query
+          schema: { type: integer }
+          description: Filter by the affected entity id (matches target_id)
+        - name: since
+          in: query
+          schema: { type: string }
+          description: Inclusive start of the date range — Unix seconds or ISO 8601
+        - name: until
+          in: query
+          schema: { type: string }
+          description: Inclusive end of the date range — Unix seconds or ISO 8601
+        - name: order
+          in: query
+          schema: { type: string, enum: [asc, desc], default: desc }
+          description: Result ordering by entry id
+      responses:
+        "200":
+          description: CSV attachment
+        "401":
+          $ref: "#/components/responses/Unauthorized"
 
   # ── SSE Events ────────────────────────────────────────────
   /api/events:
@@ -1246,36 +2359,110 @@ paths:
   /api/events/history:
     get:
       tags: [Events]
-      summary: Fetch on-chain payment event history
+      summary: Fetch on-chain payment event history (cursor paginated)
+      description: |
+        Returns on-chain `payment.created` events newest-first by on-chain id
+        (`id DESC`). Pagination follows the same opaque keyset-cursor convention
+        as `GET /api/payments`: pass `limit` (1–100, default 50) and the
+        `meta.nextCursor` value from the previous response as `cursor`. The
+        response envelope carries `meta.nextCursor` (null on the last page) and
+        `meta.hasMore`, so clients catching up after a disconnect can walk the
+        history without re-reading or skipping records.
       parameters:
         - name: limit
           in: query
-          schema: { type: integer, default: 50, maximum: 200 }
-          description: Number of recent events to return
+          schema: { type: integer, default: 50, minimum: 1, maximum: 100 }
+          description: Number of events to return (maximum 100)
+        - name: cursor
+          in: query
+          schema: { type: string }
+          description: >-
+            Opaque keyset cursor from a previous response's `meta.nextCursor`.
+            Paginates strictly below the last event id of that page. An invalid
+            cursor returns 400.
       responses:
         "200":
-          description: Recent event history
+          description: Event history page with cursor meta
+        "400":
+          description: Invalid cursor or limit
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   # ── Health ────────────────────────────────────────────────
   /api/health:
     get:
       tags: [Health]
       summary: Service health check
+      description: >-
+        Reports per-check status for the database (critical), Stellar RPC and
+        Horizon reachability, Redis (when configured), and configured contract
+        IDs. Returns 200 with status `ok` or `degraded` (only optional checks
+        failing) and 503 with status `down` when the database is unreachable.
       responses:
         "200":
-          description: All services healthy
-        "503":
-          description: One or more services unhealthy
+          description: Healthy or degraded (optional checks failing)
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/HealthResponse"
+        "503":
+          description: Critical dependency (database) unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  /api/health/live:
+    get:
+      tags: [Health]
+      summary: Liveness probe (process only)
+      description: >-
+        Lightweight liveness signal (issue #738): proves the Node process is up
+        and serving HTTP, with no database, Soroban RPC, Horizon or Redis I/O.
+        Orchestrators should wire this to `livenessProbe` / container
+        healthchecks so a transient dependency outage cannot restart-loop a
+        healthy container. The dependency-aware readiness check remains
+        `GET /api/health` (503 while the database is unreachable). Both paths
+        are exempt from the global rate limiter.
+      responses:
+        "200":
+          description: Process is alive and serving
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, data]
+                properties:
+                  success: { type: boolean, enum: [true] }
+                  data:
+                    type: object
+                    required: [status, probe, version]
+                    properties:
+                      status: { type: string, enum: [ok] }
+                      probe: { type: string, enum: [liveness] }
+                      version: { type: string }
+                      uptime:
+                        type: number
+                        description: Seconds since the process started
+                  meta:
+                    type: object
+                    properties:
+                      timestamp: { type: string, format: date-time }
 
   # ── Metrics ───────────────────────────────────────────────
   /api/metrics:
     get:
       tags: [Metrics]
       summary: Prometheus metrics endpoint
+      description: |
+        Prometheus text exposition. Now authenticated: send
+        `Authorization: Bearer $METRICS_TOKEN`, or an API key carrying the
+        `admin` scope via `Authorization: Bearer` / `X-API-Key`. Unauthenticated
+        requests receive `401` with no metric body. See
+        `docs/metrics-endpoints.md` for the scrape configuration.
+      security: [{ BearerAuth: [] }, { ApiKeyAuth: [] }]
       responses:
         "200":
           description: Prometheus text format metrics
@@ -1283,6 +2470,123 @@ paths:
             text/plain:
               schema:
                 type: string
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  # ── Jobs & Cron ──────────────────────────────────────────
+  /api/cron:
+    get:
+      tags: [Jobs & Cron]
+      summary: Scheduled-payment execution sweep (Vercel Cron ping)
+      description: |
+        Executes due scheduled payments. Vercel Cron invokes the GET path
+        with the project's `CRON_SECRET` as `Authorization: Bearer` or the
+        `x-cron-secret` header; POST runs the same work for external
+        schedulers and manual triggering.
+      responses:
+        "200":
+          description: Run summary (picked / executed / failed / skipped)
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          description: Scheduler not configured (missing secrets)
+    post:
+      tags: [Jobs & Cron]
+      summary: Run the scheduled-payment sweep manually
+      description: Same work as the GET cron ping, for external schedulers.
+      responses:
+        "200":
+          description: Run summary (picked / executed / failed / skipped)
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          description: Scheduler not configured (missing secrets)
+
+  /api/jobs/process-due-recurring:
+    post:
+      tags: [Jobs & Cron]
+      summary: Claim and execute due recurring schedules
+      description: |
+        Claims due recurring schedules (atomically, per-schedule) and creates
+        the payment for each. Intended for cron / worker invocation with an
+        authenticated session.
+      security: [{ ApiKeyAuth: [] }, { BearerAuth: [] }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                limit:
+                  type: integer
+                  minimum: 1
+                  description: Max schedules to process this run
+      responses:
+        "200":
+          description: Processed run summary
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/pause-state:
+    get:
+      tags: [Contracts]
+      summary: Contract pause state
+      description: |
+        Reads the on-chain `is_paused` flag from the payment contract via a
+        simulated contract call. `scopes` lists the ids returned by
+        `get_paused_scopes` for the per-feature pause flags (0 Payments,
+        1 Escrows, 2 Streams, 3 Recurring, 4 Refunds, 5 Governance, 6 Hooks,
+        7 Batches).
+      security: [{ ApiKeyAuth: [] }, { BearerAuth: [] }]
+      responses:
+        "200":
+          description: Pause state ({ paused, available, scopes })
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /api/csp-report:
+    post:
+      tags: [Security]
+      summary: CSP violation report collector
+      description: |
+        Receives Content-Security-Policy violation reports from browsers.
+        Accepts both the legacy `application/csp-report` envelope format and
+        the modern Reporting API `application/reports+json` array format.
+
+        This endpoint is invoked by the browser itself (not by page JavaScript)
+        when a resource violates the CSP set by `src/proxy.ts`. It is
+        intentionally CSRF-exempt: browser-generated reports carry no session
+        cookie and cannot include a CSRF token. The endpoint is size-capped
+        at 16 KiB, never mutates application state, logs a redacted structured
+        line via `logger.ts`, and increments the `csp_violation_reports_total`
+        metric.
+
+        References: issue #698, RFC 7469 (Report-URI), W3C Reporting API.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/csp-report:
+            schema:
+              type: object
+              properties:
+                csp-report:
+                  type: object
+                  description: CSP violation payload from the browser.
+          application/reports+json:
+            schema:
+              type: array
+              items:
+                type: object
+                description: Reporting API violation entry.
+      responses:
+        "204":
+          description: Report accepted (no body returned)
+        "400":
+          description: Malformed or unrecognised report body
+        "413":
+          description: Body exceeds the 16 KiB size limit
 
 # ── Components ────────────────────────────────────────────────
 components:
@@ -1299,6 +2603,23 @@ components:
       description: Same API key, passed as Bearer token
 
   schemas:
+    AssetMetadata:
+      type: object
+      description: Display metadata resolved from the issuer's SEP-1 stellar.toml
+      properties:
+        code: { type: string }
+        issuer: { type: string }
+        name: { type: [string, 'null'], description: 'Human display name from the [[CURRENCIES]] table' }
+        description: { type: [string, 'null'] }
+        image: { type: [string, 'null'] }
+        decimals: { type: [integer, 'null'] }
+        orgName: { type: [string, 'null'] }
+        homeDomain: { type: [string, 'null'], description: Issuer's home domain, when resolved }
+        source:
+          type: string
+          enum: [toml, cache, fallback]
+        fetchedAt: { type: string, format: date-time }
+
     PaymentResponse:
       type: object
       properties:
@@ -1318,6 +2639,17 @@ components:
         completedAt: { type: [string, 'null'], format: date-time }
         errorMessage: { type: [string, 'null'] }
 
+    PaymentEnvelopeResponse:
+      type: object
+      properties:
+        success: { type: boolean, const: true }
+        data:
+          $ref: "#/components/schemas/PaymentResponse"
+        meta:
+          type: object
+          properties:
+            timestamp: { type: string, format: date-time }
+
     PaginatedPayments:
       type: object
       properties:
@@ -1328,6 +2660,10 @@ components:
             $ref: "#/components/schemas/PaymentResponse"
         meta:
           type: object
+          description: |
+            Keyset mode (default): `limit`, `nextCursor`, `hasMore` (+ `total`
+            when `includeTotal=true`). Offset mode (when `page` is passed):
+            `page`, `limit`, `total`, `totalPages`, `hasNext`, `hasPrev`.
           properties:
             page: { type: integer }
             limit: { type: integer }
@@ -1351,6 +2687,28 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/PaymentResponse"
+
+    BulkCancelBatchResponse:
+      type: object
+      properties:
+        success: { type: boolean, const: true }
+        data:
+          type: object
+          properties:
+            batchId: { type: string }
+            cancelled:
+              type: integer
+              description: Number of PENDING payments flipped to CANCELLED
+            skipped:
+              type: integer
+              description: Number of already-submitted (non-PENDING) payments left untouched
+            total:
+              type: integer
+              description: Total child payments in the batch
+        meta:
+          type: object
+          properties:
+            timestamp: { type: string, format: date-time }
 
     PaginatedBatches:
       type: object
@@ -1412,7 +2770,20 @@ components:
           maxLength: 200
         memo:
           type: string
-          maxLength: 28
+          description: >-
+            Stellar memo to attach. For `MEMO_TEXT` (the default) the limit is
+            28 **UTF-8 bytes**, not characters — `"🚀".repeat(8)` is 8
+            characters but 32 bytes and is rejected. `MEMO_HASH`/
+            `MEMO_RETURN` carry exactly 64 hex characters and `MEMO_ID` an
+            unsigned 64-bit decimal integer.
+        memoType:
+          type: string
+          enum: [MEMO_TEXT, MEMO_ID, MEMO_HASH, MEMO_RETURN]
+          default: MEMO_TEXT
+          description: >-
+            Encoding of `memo`. Omitted means `MEMO_TEXT`, so text-only clients
+            are unaffected. Lowercase aliases (`text`, `id`, `hash`, `return`)
+            are accepted and normalized.
         sourceAccountId:
           type: string
           description: Source Stellar account
@@ -1432,6 +2803,11 @@ components:
         description:
           type: string
           maxLength: 500
+        idempotencyKey:
+          type: string
+          minLength: 8
+          maxLength: 255
+          description: Optional alternative to the Idempotency-Key header (trimmed before validation/storage)
         recipients:
           type: array
           minItems: 1
@@ -1516,6 +2892,28 @@ components:
           type: boolean
           default: true
 
+    TestWebhookResponse:
+      type: object
+      properties:
+        delivered:
+          type: boolean
+          description: Whether the endpoint returned a 2xx response
+        status:
+          type: string
+          enum: [delivered, failed]
+        event:
+          type: string
+          description: The simulated event type (e.g. payment.completed)
+        test:
+          type: boolean
+          description: Always true — this was a test event
+        durationMs:
+          type: integer
+          description: Round-trip delivery time in milliseconds
+        sentAt:
+          type: string
+          format: date-time
+
     HealthResponse:
       type: object
       properties:
@@ -1524,6 +2922,7 @@ components:
           type: object
           properties:
             version: { type: string }
+            status: { type: string, enum: [ok, degraded, down] }
             services:
               type: object
               properties:
@@ -1542,11 +2941,36 @@ components:
                   properties:
                     network: { type: string }
                     rpcUrl: { type: string }
+                    horizonUrl: { type: string }
                     rpc:
                       type: object
                       properties:
                         status: { type: string, enum: [ok, error, unchecked] }
                         latencyMs: { type: [integer, 'null'] }
+                    horizon:
+                      type: object
+                      properties:
+                        status: { type: string, enum: [ok, error, unchecked] }
+                        latencyMs: { type: [integer, 'null'] }
+                    contracts:
+                      type: object
+                      properties:
+                        status: { type: string, enum: [ok, error] }
+                        ophirpay:
+                          type: object
+                          properties:
+                            id: { type: [string, 'null'] }
+                            status: { type: string, enum: [ok, error, not_configured] }
+                        emitter:
+                          type: object
+                          properties:
+                            id: { type: [string, 'null'] }
+                            status: { type: string, enum: [ok, error, not_configured] }
+                        chainReadSource:
+                          type: object
+                          properties:
+                            id: { type: [string, 'null'] }
+                            status: { type: string, enum: [ok, error, not_configured] }
             uptime: { type: number }
         meta:
           type: object
@@ -1555,6 +2979,10 @@ components:
 
     ErrorResponse:
       type: object
+      description: >-
+        Legacy error envelope still used by most routes. The payment mutation
+        routes (`POST /api/payments`, `/cancel`, `/retry`) answer with
+        `ProblemDetails` instead.
       properties:
         success: { type: boolean, const: false }
         error:
@@ -1562,6 +2990,64 @@ components:
           properties:
             code: { type: string }
             message: { type: string }
+
+    ProblemFieldError:
+      type: object
+      description: One invalid request field.
+      required: [field, message]
+      properties:
+        field:
+          type: string
+          description: Dotted path of the field, e.g. `memo` or `recipients.0.address`.
+        message:
+          type: string
+          description: User-facing explanation, safe to display next to the input.
+        code:
+          type: string
+          description: Machine-readable reason (e.g. the underlying Zod issue code).
+
+    ProblemDetails:
+      type: object
+      description: |
+        RFC 7807 / RFC 9457 problem details, served as
+        `application/problem+json`.
+
+        `type` identifies the problem *class* (a stable documentation URI),
+        `title` names it, and `detail` explains this particular occurrence.
+        `code` and `errors` are extension members carrying the OphirPay error
+        code from the catalog and the per-field validation failures.
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          format: uri-reference
+          description: >-
+            Stable URI for the problem class, e.g.
+            `https://ophirpay.dev/problems/memo-too-long`. `about:blank` when no
+            specific type applies.
+        title:
+          type: string
+          description: Short, human-readable summary of the problem class.
+        status:
+          type: integer
+          description: HTTP status code, repeated here for log-only consumers.
+        detail:
+          type: string
+          description: Request-specific explanation, safe to display.
+        instance:
+          type: string
+          description: Path of the request that produced the problem.
+        code:
+          type: string
+          description: OphirPay error code (`VALIDATION_ERROR`, `MEMO_TOO_LONG`, …).
+        requestId:
+          type: string
+          description: Mirrors the `X-Request-Id` response header.
+        errors:
+          type: array
+          description: Per-field validation failures, when the request had a body.
+          items:
+            $ref: "#/components/schemas/ProblemFieldError"
 
   responses:
     ValidationError:
@@ -1834,4 +3320,3 @@ components:
       - RPC_UNAVAILABLE
       - DATABASE_UNAVAILABLE
       - CACHE_UNAVAILABLE
-      - EMAIL_UNAVAILABLE

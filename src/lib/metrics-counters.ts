@@ -18,13 +18,143 @@ const counters = {
   webhooks_failed_total: 0,
   db_query_duration_seconds_sum: 0,
   db_query_duration_seconds_count: 0,
+  /** Gauge: currently open SSE event-stream connections (inc on connect, dec on disconnect). */
+  sse_open_connections: 0,
+  /**
+   * Counter: SSE events shed because a slow/stalled consumer exhausted its
+   * bounded outbound buffer (issue #744). A rising value with a flat
+   * `sse_open_connections` means clients are being out-paced by the stream.
+   */
+  sse_dropped_events_total: 0,
+  /** Counter: cumulative RPC failover transitions (issue #820). */
+  rpc_failover_total: 0,
+  /** Counter: cumulative RPC recoveries to the primary endpoint (issue #820). */
+  rpc_failover_recoveries_total: 0,
+  /**
+   * Counter: CSP violation reports received at POST /api/csp-report (issue #698).
+   * Incremented once per accepted, parsed, and logged report.  Oversized or
+   * malformed requests are rejected before reaching this counter.
+   */
+  csp_violation_reports_total: 0,
 };
 
+export type CspReportDropReason = "rate_limited" | "deduplicated" | "oversized";
+
+const cspReportsDropped = new Map<CspReportDropReason, number>([
+  ["rate_limited", 0],
+  ["deduplicated", 0],
+  ["oversized", 0],
+]);
+
+/** Increment the counter for dropped CSP violation reports (#1392). */
+export function incCspReportsDropped(reason: CspReportDropReason, delta = 1): void {
+  cspReportsDropped.set(reason, (cspReportsDropped.get(reason) ?? 0) + delta);
+}
+
+/** Get a snapshot of dropped CSP report counts by reason. */
+export function getCspReportsDroppedSnapshot(): Record<CspReportDropReason, number> {
+  return {
+    rate_limited: cspReportsDropped.get("rate_limited") ?? 0,
+    deduplicated: cspReportsDropped.get("deduplicated") ?? 0,
+    oversized: cspReportsDropped.get("oversized") ?? 0,
+  };
+}
+
+/** Last failover snapshot read by a scrape, for diffing gauge/counter gauges. */
+let lastRpcFailover: {
+  failoverCount: number;
+  recoveryCount: number;
+  activeEndpoint: string | null;
+  primaryEndpoint: string | null;
+  usingFallback: boolean;
+  currentFallbackDurationMs: number;
+  longestFallbackDurationMs: number;
+} | null = null;
+
+/** Store the latest RPC failover state so the metrics exposition stays consistent. */
+export function recordRpcFailoverState(state: NonNullable<typeof lastRpcFailover>): void {
+  lastRpcFailover = state;
+  counters.rpc_failover_total = state.failoverCount;
+  counters.rpc_failover_recoveries_total = state.recoveryCount;
+}
+
+/** Read the last recorded RPC failover state (null before the first record). */
+export function getRpcFailoverSnapshot(): typeof lastRpcFailover {
+  return lastRpcFailover;
+}
+
 export type MetricName = keyof typeof counters;
+export type DeliveryType = "webhook" | "batch";
+export type DeliveryFinalOutcome = "success" | "failure";
+
+export interface DeliveryAttemptMetric {
+  delivery_type: DeliveryType;
+  attempt_number: number;
+  count: number;
+}
+
+export interface DeliveryFinalOutcomeMetric extends DeliveryAttemptMetric {
+  final_outcome: DeliveryFinalOutcome;
+}
+
+const deliveryAttempts = new Map<string, DeliveryAttemptMetric>();
+const deliveryFinalOutcomes = new Map<string, DeliveryFinalOutcomeMetric>();
+
+function assertAttemptNumber(attemptNumber: number): void {
+  if (!Number.isInteger(attemptNumber) || attemptNumber < 1) {
+    throw new Error("attemptNumber must be a positive integer");
+  }
+}
+
+function attemptKey(deliveryType: DeliveryType, attemptNumber: number): string {
+  return `${deliveryType}:${attemptNumber}`;
+}
+
+function finalOutcomeKey(
+  deliveryType: DeliveryType,
+  attemptNumber: number,
+  finalOutcome: DeliveryFinalOutcome
+): string {
+  return `${deliveryType}:${attemptNumber}:${finalOutcome}`;
+}
 
 /** Increment a named counter. */
 export function incMetric(name: MetricName, delta = 1): void {
   counters[name] += delta;
+}
+
+/** Count one delivery attempt for a webhook or batch delivery path. */
+export function incDeliveryAttempt(
+  deliveryType: DeliveryType,
+  attemptNumber: number
+): void {
+  assertAttemptNumber(attemptNumber);
+  const key = attemptKey(deliveryType, attemptNumber);
+  const current = deliveryAttempts.get(key);
+
+  deliveryAttempts.set(key, {
+    delivery_type: deliveryType,
+    attempt_number: attemptNumber,
+    count: (current?.count ?? 0) + 1,
+  });
+}
+
+/** Count the terminal delivery outcome, labelled by final attempt number. */
+export function incDeliveryFinalOutcome(
+  deliveryType: DeliveryType,
+  attemptNumber: number,
+  finalOutcome: DeliveryFinalOutcome
+): void {
+  assertAttemptNumber(attemptNumber);
+  const key = finalOutcomeKey(deliveryType, attemptNumber, finalOutcome);
+  const current = deliveryFinalOutcomes.get(key);
+
+  deliveryFinalOutcomes.set(key, {
+    delivery_type: deliveryType,
+    attempt_number: attemptNumber,
+    final_outcome: finalOutcome,
+    count: (current?.count ?? 0) + 1,
+  });
 }
 
 /** Record a duration observation in seconds. */
@@ -34,8 +164,38 @@ export function observeDbQuery(durationSeconds: number): void {
 }
 
 /** Read current counter values (for scraping). */
-export function getMetricsSnapshot(): typeof counters {
-  return { ...counters };
+export function getMetricsSnapshot(): typeof counters & {
+  delivery_attempts: DeliveryAttemptMetric[];
+  delivery_final_outcomes: DeliveryFinalOutcomeMetric[];
+  csp_reports_dropped: Record<CspReportDropReason, number>;
+} {
+  return {
+    ...counters,
+    delivery_attempts: [...deliveryAttempts.values()].sort(
+      (a, b) =>
+        a.delivery_type.localeCompare(b.delivery_type) ||
+        a.attempt_number - b.attempt_number
+    ),
+    delivery_final_outcomes: [...deliveryFinalOutcomes.values()].sort(
+      (a, b) =>
+        a.delivery_type.localeCompare(b.delivery_type) ||
+        a.attempt_number - b.attempt_number ||
+        a.final_outcome.localeCompare(b.final_outcome)
+    ),
+    csp_reports_dropped: getCspReportsDroppedSnapshot(),
+  };
+}
+
+export function resetMetricsForTest(): void {
+  for (const key of Object.keys(counters) as MetricName[]) {
+    counters[key] = 0;
+  }
+  deliveryAttempts.clear();
+  deliveryFinalOutcomes.clear();
+  lastRpcFailover = null;
+  for (const reason of ["rate_limited", "deduplicated", "oversized"] as CspReportDropReason[]) {
+    cspReportsDropped.set(reason, 0);
+  }
 }
 
 // ── Per-endpoint latency histograms and error counts ──────────

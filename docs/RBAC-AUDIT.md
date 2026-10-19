@@ -1,8 +1,8 @@
-# RBAC Audit — State-Changing API Routes
-
-> Generated for [Issue #388](https://github.com/OphirPay/OphirPay/issues/392).
-> Each state-changing route (POST / PUT / PATCH / DELETE) is listed with its
+> Generated for [Issue #392](https://github.com/OphirPay/OphirPay/issues/392).
+> Audit of state-changing routes (POST / PUT / PATCH / DELETE), listed with its
 > required authentication and any role-based access control enforcement.
+
+# RBAC Audit — State-Changing API Routes
 
 ## Legend
 
@@ -30,6 +30,7 @@
 | `/api/escrows` | POST | 👤 | — | Create escrow. Delegated to client-side signing. |
 | `/api/streams` | POST | 👤 | — | Create payment stream. Delegated to client-side signing. |
 | `/api/batches` | POST | 👤 | — | Create batch payment. Delegated to client-side signing. |
+| `/api/batches/[id]` | POST | 👤 | — | Bulk-cancel pending payments. User-scoped via `userId`. |
 | `/api/recurring` | POST | 👤 | — | Create recurring payment. Delegated to client-side signing. |
 | `/api/requests` | POST | 👤 | — | Create payment request. User-scoped. |
 | `/api/refunds` | POST | 👤 | — | Create refund request. User-scoped. |
@@ -86,7 +87,10 @@ authenticated user.
 | Route | Notes |
 |-------|-------|
 | `/api/health` | Health check — bypasses rate limiting |
-| `/api/metrics` | Prometheus metrics — bypasses rate limiting |
+
+> `/api/metrics` was public when this audit was written; it now requires a
+> scrape credential (`METRICS_TOKEN` bearer token or an admin API key) — see
+> [Per-Endpoint Metrics](./metrics-endpoints.md).
 
 ## Gaps Found
 

@@ -12,7 +12,7 @@ src/components/                    @OphirPay/frontend
 
 # ── Backend API routes ──────────────────────────────────────────
 src/app/api/                       @OphirPay/backend
-src/middleware.ts                  @OphirPay/backend
+src/proxy.ts                       @OphirPay/backend
 
 # ── Shared library ──────────────────────────────────────────────
 src/lib/                           @OphirPay/backend @OphirPay/frontend
@@ -33,6 +33,7 @@ helm/                              @OphirPay/devops
 # ── Security ────────────────────────────────────────────────────
 .gitleaks.toml                     @OphirPay/devops
 src/lib/api-auth.ts                @OphirPay/backend
+src/lib/auth-rate-limit.ts         @OphirPay/backend
 src/lib/crypto.ts                  @OphirPay/backend
 src/lib/rate-limit.ts              @OphirPay/backend
 SECURITY.md                        @OphirPay/backend

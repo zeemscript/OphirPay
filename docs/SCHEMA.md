@@ -12,6 +12,7 @@ erDiagram
     User ||--o{ Payment : creates
     User ||--o{ Batch : owns
     User ||--o{ Recurrence : owns
+    User ||--o{ ScheduledPayment : schedules
     User ||--o{ PaymentRequest : creates
     User ||--o{ Webhook : configures
     User ||--o{ ApiKey : creates
@@ -91,6 +92,27 @@ erDiagram
         boolean isActive "Default: true"
         datetime nextRunAt "Next scheduled execution"
         datetime lastRunAt "Last execution time"
+        datetime createdAt "Auto-set on create"
+        datetime updatedAt "Auto-updated"
+    }
+
+    ScheduledPayment {
+        string id PK "cuid"
+        string userId FK "→ User"
+        decimal amount "Decimal(18,7)"
+        string assetCode "Default: XLM"
+        string assetIssuer "Issuer for non-native assets"
+        string destAddress "Stellar destination address"
+        string memo "Optional Stellar memo"
+        string description "Optional note"
+        datetime scheduledAt "When the payment becomes due"
+        ScheduledPaymentStatus status "Default: SCHEDULED"
+        datetime lockedAt "Execution lease taken by a cron run"
+        string lockedBy "Id of the run holding the lease"
+        int attempts "Submission attempts (cap: 3)"
+        string transactionHash "Set once executed"
+        string errorMessage "Last submission error"
+        datetime executedAt "When the payment was submitted"
         datetime createdAt "Auto-set on create"
         datetime updatedAt "Auto-updated"
     }
@@ -198,6 +220,19 @@ erDiagram
 | `QUARTERLY` | Every 3 months |
 | `YEARLY` | Once per year |
 
+### ScheduledPaymentStatus
+
+Lifecycle of a one-off scheduled payment, driven by the cron endpoint
+(`/api/cron` — see [Scheduled Payment Cron](scheduled-payment-cron.md)).
+
+| Value | Description |
+|---|---|
+| `SCHEDULED` | Queued — waiting for `scheduledAt` to pass, or awaiting a retry |
+| `PROCESSING` | Claimed by a cron run and being submitted (lease held in `lockedAt`) |
+| `EXECUTED` | Submitted to Stellar — `transactionHash` is set |
+| `FAILED` | Gave up after the attempt cap — check `errorMessage` |
+| `CANCELLED` | Cancelled before it ran |
+
 ### RequestStatus
 
 | Value | Description |
@@ -226,6 +261,7 @@ erDiagram
 | User → Payment | 1:N | A user creates multiple payments |
 | User → Batch | 1:N | A user owns multiple batch groups |
 | User → Recurrence | 1:N | A user has multiple recurring schedules |
+| User → ScheduledPayment | 1:N | A user schedules multiple future payments |
 | User → PaymentRequest | 1:N | A user creates multiple payment requests |
 | User → Webhook | 1:N | A user configures multiple webhooks |
 | User → ApiKey | 1:N | A user creates multiple API keys |
@@ -241,17 +277,25 @@ erDiagram
 
 ## Database Providers
 
-OphirPay supports two database providers, switchable via the `DATABASE_PROVIDER` environment variable:
+PostgreSQL is the canonical provider for CI and production. `DATABASE_PROVIDER`
+does not switch Prisma's datasource: the committed `prisma/schema.prisma`
+selects PostgreSQL, and SQLite requires local, uncommitted schema edits.
+SQLite also does not support every production type or migration. See the
+[Database Provider Compatibility guide](DATABASE_PROVIDERS.md) for feature
+differences, the status of all 18 migrations, and data-transfer guidance.
 
 | Provider | Use Case | Connection |
 |---|---|---|
-| **SQLite** | Local development | `file:./dev.db` |
+| **SQLite** | Local experiments only | `file:./dev.db` |
 | **PostgreSQL** | Production (Neon, Supabase, RDS) | Connection string with pooling |
 
 ### Provider-specific notes
 
-- **SQLite**: Used for local development with `npx prisma db push`. No migrations needed.
-- **PostgreSQL**: Used in production with `npx prisma migrate deploy`. Supports connection pooling via `DIRECT_DATABASE_URL`.
+- **SQLite**: Local schema changes use `npx prisma db push`; the PostgreSQL
+  migration history does not apply.
+- **PostgreSQL**: CI and production use `npx prisma migrate deploy`. The
+  committed datasource currently reads `DATABASE_URL`; setting
+  `DIRECT_DATABASE_URL` alone does not redirect Prisma CLI commands.
 
 ---
 
@@ -284,11 +328,18 @@ The schema defines the following indexes for query performance:
 | Payment | `userId`, `status`, `batchId`, `recurrenceId`, `sourceAccountId`, `destAccountId` | Filter by user, status, batch, recurrence, or account |
 | Batch | `userId`, `status` | Filter by user or status |
 | Recurrence | `userId`, `nextRunAt` | Scheduler query for next execution |
+| ScheduledPayment | `userId`, (`status`, `scheduledAt`) | Fast lookup per user; the composite serves the cron's due-selection query |
 | PaymentRequest | `userId` | Fast lookup per user |
 | Webhook | `userId` | Fast lookup per user |
 | Refund | `userId`, `status`, `paymentId` | Filter by user, status, or parent payment |
 | NotificationHook | `userId`, `eventType` | Filter by user or event type |
 | ApiKey | `userId`, `prefix` | Fast lookup by user or key prefix |
+
+---
+
+## 📚 Migration Workflow & Safe Deployment
+
+For a detailed guide on authoring, testing, and safely applying Prisma migrations without table locks (including the `CREATE INDEX CONCURRENTLY` caveat), see **[Database Schema & Migration Guide](./DATABASE_SCHEMA_MIGRATIONS.md)**.
 
 ---
 
