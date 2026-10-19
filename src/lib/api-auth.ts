@@ -36,23 +36,63 @@ export {
  * unlike the previous pattern that fetched every key and compared in-app.
  */
 
+// ── Key format (#1397) ─────────────────────────────────────────
+
+export * from "@/lib/api-key-format";
+import {
+  API_KEY_RANDOM_BYTES,
+  API_KEY_DIGEST_VERSION,
+  API_KEY_LOOKUP_PATTERN,
+  calculateCrc32,
+  assertValidApiKeyFormat,
+  validateKeyFormat,
+  deriveKeyPrefix,
+} from "@/lib/api-key-format";
+
+/**
+ * Generate a new standardized API key: `op_{env}_{32_hex_bytes}_{4_byte_crc}` (#1397).
+ * Defaults to `live` in production and `test` in development/testing.
+ */
+export function generateApiKey(options?: { env?: "live" | "test" }): string {
+  const env =
+    options?.env ??
+    (process.env.NODE_ENV === "production" ? "live" : "test");
+  const randomHex = crypto
+    .randomBytes(API_KEY_RANDOM_BYTES)
+    .toString("hex");
+  const payload = `op_${env}_${randomHex}`;
+  const crc = calculateCrc32(payload);
+  const rawKey = `${payload}_${crc}`;
+  assertValidApiKeyFormat(rawKey);
+  return rawKey;
+}
+
 // ── Hashing ────────────────────────────────────────────────────
 
 /**
- * Length of the API key prefix used for indexed lookups + display.
- * MUST be identical in key creation (src/app/api/keys/route.ts) and
- * lookup here — a mismatch silently breaks every authenticated request.
+ * Legacy digest: unsalted SHA-256 hex. Retained so keys created before the
+ * `v1:` tag (and before the 32-byte format) continue to authenticate.
  */
-export const API_KEY_PREFIX_LENGTH = 8;
-
-/** Derive the stable lookup prefix for a raw API key. */
-export function deriveKeyPrefix(rawKey: string): string {
-  return rawKey.slice(0, API_KEY_PREFIX_LENGTH);
-}
-
-/** Hash a raw API key using SHA-256 (sync, Node crypto). */
 export function hashApiKey(rawKey: string): string {
   return crypto.createHash("sha256").update(rawKey).digest("hex");
+}
+
+/**
+ * Current digest: `v1:<sha256 hex>`. The version tag is stored in the same
+ * `keyHash` column, so a future pepper/KDF migration has somewhere to live
+ * without a schema change — older digests keep authenticating meanwhile.
+ */
+export function hashApiKeyV1(rawKey: string): string {
+  return `${API_KEY_DIGEST_VERSION}:${hashApiKey(rawKey)}`;
+}
+
+/**
+ * Every stored digest a raw key may match, newest format first. The auth
+ * lookup queries `keyHash: { in: … }` with these so pre-#701 keys (bare
+ * SHA-256) and post-#701 keys (`v1:` prefixed) both resolve.
+ */
+export function apiKeyLookupHashes(rawKey: string): string[] {
+  return [hashApiKeyV1(rawKey), hashApiKey(rawKey)];
 }
 
 // ── Header Extraction ──────────────────────────────────────────
@@ -91,13 +131,18 @@ export async function authenticateRequest(
 ): Promise<AuthResult | null> {
   const rawKey = extractApiKey(request);
   if (!rawKey) return null;
+  // Reject obviously malformed material before hitting the database (#1397).
+  // Accepts standardized format with verified CRC, plus legacy formats.
+  const isStandardValid = validateKeyFormat(rawKey).valid;
+  const isLegacyValid = API_KEY_LOOKUP_PATTERN.test(rawKey);
+  if (!isStandardValid && !isLegacyValid) return null;
 
-  const keyHash = hashApiKey(rawKey);
   const prefix = deriveKeyPrefix(rawKey);
+  const keyHashes = apiKeyLookupHashes(rawKey);
 
   try {
     const apiKey = await prisma.apiKey.findFirst({
-      where: { keyHash, prefix },
+      where: { keyHash: { in: keyHashes }, prefix, revokedAt: null },
       select: {
         id: true,
         userId: true,
@@ -115,6 +160,9 @@ export async function authenticateRequest(
     // Update lastUsed — fire-and-forget so auth latency is not gated on this write
     prisma.apiKey
       .update({ where: { id: apiKey.id }, data: { lastUsed: new Date() } })
+      .catch(() => {});
+    prisma.apiKeyRequestLog
+      .create({ data: { keyId: apiKey.id } })
       .catch(() => {});
 
     return {

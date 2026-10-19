@@ -18,6 +18,8 @@
   </p>
 </div>
 
+<!-- readme-sync: 49e2c32c0d25832fc35725e57127231ead5bc8f3 -->
+
 ---
 
 ## 📑 目次
@@ -25,7 +27,7 @@
 - [✨ なぜOphirPay？](#-なぜophirpay)
 - [🚀 ライブデモ](#-ライブデモ)
 - [🧭 システムアーキテクチャ](#-システムアーキテクチャ)
-- [⚡ クイックスタート](#-クイックスタート)
+- [⚡ クイックスタート](#-クイックスタート60秒)
 - [🔐 ウォレット統合](#-ウォレット統合)
 - [📡 リアルタイムイベント](#-リアルタイムイベント)
 - [🧪 スマートコントラクト](#-スマートコントラクト)
@@ -59,7 +61,7 @@
 | **タイムロック管理アクション**（24時間遅延） | ✅ | ❌ |
 | **DAOガバナンス**（提案→投票→実行） | ✅ | ❌ |
 
-> 上記のすべての機能にはダッシュボードUIページがあります。詳細は[ロードマップ](#-ロードマップ)を参照。
+> 上記のすべての機能にはダッシュボードUIページがあります。詳細は[ロードマップ](README.md#-roadmap)を参照。
 
 ---
 
@@ -259,7 +261,7 @@ npm run ci   # typecheck → lint → test → build
 | **ウォレット** | Freighter · xBull · Rabet · Albedo · Lobstr · Ledger | 6コネクターの統合アブストラクション |
 | **データベース** | [Prisma](https://prisma.io) + PostgreSQL (Neon) / SQLite | 型安全ORM、プロバイダー切り替え |
 | **テスト** | [Vitest](https://vitest.dev) + React Testing Library + [Playwright](https://playwright.dev) | ユニット、統合、E2Eカバレッジ |
-| **CI/CD** | [GitHub Actions](https://github.com/features/actions) | 各プッシュで22ジョブのパイプライン |
+| **CI/CD** | [GitHub Actions](https://github.com/features/actions) | push/PRごとに4ジョブのCI + スケジュール実行ワークフロー |
 | **ホスティング** | [Vercel](https://vercel.com) | `main`から自動デプロイ、エッジネットワーク |
 
 ---

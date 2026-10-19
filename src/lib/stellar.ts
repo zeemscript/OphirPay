@@ -8,8 +8,23 @@ import {
   Operation,
   Asset,
   Memo,
+  Keypair,
+  Config,
 } from "@stellar/stellar-sdk";
 import { getStellarErrorMessage } from "./stellar-error";
+import {
+  getHorizonTimeoutMs,
+  getSorobanTimeoutMs,
+  getStellarTimeoutMs,
+  withStellarTimeoutProxy,
+} from "./timeout";
+import {
+  getFeeAggressiveness,
+  getFallbackBaseFee,
+  parseFeeStats,
+  recommendFee,
+  type RawFeeStats,
+} from "./fee-stats";
 
 // ── Batch Recipient ───────────────────────────────────────────
 
@@ -50,13 +65,27 @@ export const NETWORK_PASSPHRASE =
 
 // ── Horizon Server ─────────────────────────────────────────────
 
+// ── Outbound timeouts (issue #747) ─────────────────────────────
+//
+// Every Horizon/Soroban call must carry an explicit, configurable timeout so a
+// slow upstream surfaces as a classified error instead of a hung request.
+// `Config.setTimeout` sets the SDK-wide default (federation/stellartoml and
+// the SDK's own HTTP client), while the proxies below enforce the budget on
+// each Horizon/Soroban method call.
+Config.setTimeout(getStellarTimeoutMs());
+
 let _horizonServer: Horizon.Server | null = null;
 
 export function getHorizonServer(): Horizon.Server {
   if (!_horizonServer) {
     _horizonServer = new Horizon.Server(HORIZON_URL);
   }
-  return _horizonServer;
+  // Timeout-enforcing view: every method (and fluent call builder) is wrapped.
+  return withStellarTimeoutProxy(
+    _horizonServer,
+    getHorizonTimeoutMs(),
+    "Horizon"
+  );
 }
 
 // ── Soroban RPC Server (lazy initialized) ──────────────────────
@@ -67,9 +96,48 @@ export function getSorobanServer(): rpc.Server {
   if (!_sorobanServer) {
     _sorobanServer = new rpc.Server(SOROBAN_RPC_URL, {
       allowHttp: false,
+      // The SDK aborts the underlying request once this budget elapses…
+      timeout: getSorobanTimeoutMs(),
     });
   }
-  return _sorobanServer;
+  // …and the proxy turns the expiry into a classified `TimeoutError`.
+  return withStellarTimeoutProxy(
+    _sorobanServer,
+    getSorobanTimeoutMs(),
+    "Soroban RPC"
+  );
+}
+
+// ── Transaction Fees (issue #825) ──────────────────────────────
+
+/**
+ * Resolve the per-operation fee for a new transaction from Horizon fee
+ * statistics.
+ *
+ * The aggressiveness policy (see `@/lib/fee-stats`) selects a `fee_charged`
+ * percentile, floored at the network base fee, so transactions are bid to
+ * clear during congestion instead of stalling. When `/fee_stats` is
+ * unavailable it degrades to `fetchBaseFee()`, then to the configured
+ * constant, so a Horizon blip can never block transaction building.
+ */
+export async function resolveTransactionFee(
+  server: Horizon.Server
+): Promise<number> {
+  try {
+    const stats = parseFeeStats(
+      (await server.feeStats()) as unknown as RawFeeStats
+    );
+    return recommendFee(stats, getFeeAggressiveness()).recommendedFee;
+  } catch {
+    try {
+      const baseFee = Number(await server.fetchBaseFee());
+      return Number.isFinite(baseFee) && baseFee > 0
+        ? baseFee
+        : getFallbackBaseFee();
+    } catch {
+      return getFallbackBaseFee();
+    }
+  }
 }
 
 // ── Balance Fetching ───────────────────────────────────────────
@@ -344,6 +412,13 @@ export async function findStrictSendPath(params: {
 export interface BuildTxResult {
   xdr: string;
   sourceAccount: Horizon.AccountResponse;
+  /**
+   * Per-operation fee (stroops) baked into the built transaction. Exposed so
+   * the confirmation UI can display the exact fee that was signed rather than
+   * re-deriving it (issue #825: "the fee shown before signing matches the fee
+   * submitted").
+   */
+  fee?: number;
 }
 
 /**
@@ -370,6 +445,12 @@ export async function buildPaymentTx(params: {
   destAssetIssuer?: string;
   destMin?: string;
   path?: Asset[];
+  /**
+   * Explicit per-operation fee in stroops (from the fee selector, #1373).
+   * When omitted or invalid the builder resolves a live recommendation, which
+   * keeps every other caller on the automatic path.
+   */
+  fee?: number;
 }): Promise<BuildTxResult> {
   const {
     sourcePublicKey,
@@ -384,6 +465,7 @@ export async function buildPaymentTx(params: {
     destAssetIssuer,
     destMin,
     path,
+    fee: feeOverride,
   } = params;
 
   const isCrossAsset =
@@ -410,9 +492,15 @@ export async function buildPaymentTx(params: {
   const now = Math.floor(Date.now() / 1000);
 
   const paymentAsset = createAsset(assetCode, assetIssuer);
+  const fee =
+    feeOverride !== undefined &&
+    Number.isSafeInteger(feeOverride) &&
+    feeOverride > 0
+      ? feeOverride
+      : await resolveTransactionFee(server);
 
   let builder = new TransactionBuilder(sourceAccount, {
-    fee: (await server.fetchBaseFee()).toString(),
+    fee: fee.toString(),
     networkPassphrase: NETWORK_PASSPHRASE,
     timebounds: {
       minTime: 0,
@@ -445,7 +533,7 @@ export async function buildPaymentTx(params: {
   }
 
   const tx = builder.build();
-  return { xdr: tx.toXDR(), sourceAccount };
+  return { xdr: tx.toXDR(), sourceAccount, fee };
 }
 
 /**
@@ -464,6 +552,8 @@ export async function buildPathPaymentStrictSendTx(params: {
   destAssetIssuer?: string;
   path?: Asset[];
   memo?: string;
+  /** Explicit per-operation fee in stroops (from the fee selector, #1373). */
+  fee?: number;
 }): Promise<BuildTxResult> {
   const {
     sourcePublicKey,
@@ -476,6 +566,7 @@ export async function buildPathPaymentStrictSendTx(params: {
     destAssetIssuer,
     path = [],
     memo,
+    fee: feeOverride,
   } = params;
 
   const server = getHorizonServer();
@@ -484,9 +575,15 @@ export async function buildPathPaymentStrictSendTx(params: {
 
   const sendAsset = createAsset(sourceAssetCode, sourceAssetIssuer);
   const destAsset = createAsset(destAssetCode, destAssetIssuer);
+  const fee =
+    feeOverride !== undefined &&
+    Number.isSafeInteger(feeOverride) &&
+    feeOverride > 0
+      ? feeOverride
+      : await resolveTransactionFee(server);
 
   let builder = new TransactionBuilder(sourceAccount, {
-    fee: (await server.fetchBaseFee()).toString(),
+    fee: fee.toString(),
     networkPassphrase: NETWORK_PASSPHRASE,
     timebounds: {
       minTime: 0,
@@ -508,7 +605,7 @@ export async function buildPathPaymentStrictSendTx(params: {
   }
 
   const tx = builder.build();
-  return { xdr: tx.toXDR(), sourceAccount };
+  return { xdr: tx.toXDR(), sourceAccount, fee };
 }
 
 /**
@@ -525,10 +622,10 @@ export async function buildBatchPaymentTx(params: {
   const sourceAccount = await server.loadAccount(sourcePublicKey);
 
   const now = Math.floor(Date.now() / 1000);
-  const baseFee = (await server.fetchBaseFee()).toString();
+  const fee = await resolveTransactionFee(server);
 
   let builder = new TransactionBuilder(sourceAccount, {
-    fee: baseFee,
+    fee: fee.toString(),
     networkPassphrase: NETWORK_PASSPHRASE,
     timebounds: {
       minTime: 0,
@@ -547,7 +644,7 @@ export async function buildBatchPaymentTx(params: {
   }
 
   const tx = builder.build();
-  return { xdr: tx.toXDR(), sourceAccount };
+  return { xdr: tx.toXDR(), sourceAccount, fee };
 }
 
 /**
@@ -562,6 +659,41 @@ export async function submitSignedTx(
     NETWORK_PASSPHRASE
   );
   return server.submitTransaction(transaction);
+}
+
+/** Derive the public key of the account behind a Stellar secret key. */
+export function publicKeyFromSecret(secret: string): string {
+  return Keypair.fromSecret(secret).publicKey();
+}
+
+/**
+ * Build, sign and submit a payment from a server-held secret key.
+ *
+ * Unlike the interactive flows — which build an XDR here and hand it to the
+ * user's wallet to sign — the scheduled-payment cron (issue #175) has no
+ * browser to sign in, so it signs with the funded operator account named by
+ * `SCHEDULED_PAYMENTS_SOURCE_SECRET`. The account is loaded fresh on every
+ * call, so callers must submit sequentially to keep sequence numbers in step.
+ */
+export async function submitPaymentFromSecret(params: {
+  sourceSecret: string;
+  destination: string;
+  amount: string;
+  memo?: string;
+  assetCode?: string;
+  assetIssuer?: string;
+}): Promise<SubmitResult> {
+  const { sourceSecret, ...payment } = params;
+  const keypair = Keypair.fromSecret(sourceSecret);
+
+  const { xdr } = await buildPaymentTx({
+    sourcePublicKey: keypair.publicKey(),
+    ...payment,
+  });
+
+  const tx = TransactionBuilder.fromXDR(xdr, NETWORK_PASSPHRASE);
+  tx.sign(keypair);
+  return submitSignedTx(tx.toXDR());
 }
 
 /**
@@ -643,4 +775,74 @@ export function getAccountExplorerUrl(publicKey: string): string {
 
 export function isValidStellarAddress(address: string): boolean {
   return /^G[A-Z0-9]{55}$/.test(address);
+}
+
+// ── Memo Validation ─────────────────────────────────────────
+
+/** Maximum memo size in bytes (Stellar protocol limit). */
+export const MEMO_MAX_BYTES = 28;
+
+/** Allowed Stellar memo types. */
+export type StellarMemoType = "text" | "id" | "hash" | "return";
+
+export interface MemoValidationResult {
+  valid: boolean;
+  error?: string;
+}
+
+/**
+ * Validate a Stellar memo before building a transaction.
+ *
+ * Stellar memos are limited to 28 bytes. The current implementation
+ * only supports text memos (Memo.text()). Multi-byte UTF-8 characters
+ * (e.g. é, ñ, emojis) consume more than 1 byte each, so we must check
+ * the actual byte length rather than the string character count.
+ *
+ * @param memo - The memo string to validate (optional)
+ * @returns MemoValidationResult with valid flag and optional error message
+ */
+export function validateMemo(memo?: string): MemoValidationResult {
+  if (!memo || memo.trim() === "") {
+    return { valid: true };
+  }
+
+  const trimmed = memo.trim();
+  const byteLength = new TextEncoder().encode(trimmed).byteLength;
+
+  if (byteLength > MEMO_MAX_BYTES) {
+    return {
+      valid: false,
+      error: `Memo exceeds the ${MEMO_MAX_BYTES}-byte limit (${byteLength} bytes). ` +
+        "Use shorter text or remove multi-byte characters (emojis, accented letters).",
+    };
+  }
+
+  return { valid: true };
+}
+
+/**
+ * Map a Horizon or contract error message to a user-friendly memo error.
+ * Returns null if the error is not memo-related.
+ */
+export function getMemoErrorMessage(error: string): string | null {
+  const lower = error.toLowerCase();
+
+  // Most specific: the Horizon tx_memo_required result code
+  if (lower.includes("tx_memo_required")) {
+    return "This account requires a memo to receive payments. Please add a memo.";
+  }
+  if (lower.includes("memo") && (lower.includes("too long") || lower.includes("exceeds"))) {
+    return "Memo is too long. Stellar memos are limited to 28 bytes.";
+  }
+  if (lower.includes("memo") && lower.includes("invalid")) {
+    return "Invalid memo format. Use plain text, numbers, or hex.";
+  }
+  if (lower.includes("tx_bad") && lower.includes("memo")) {
+    return "Transaction rejected due to an invalid memo. Check the memo format and try again.";
+  }
+  if (lower.includes("op_bad") && lower.includes("memo")) {
+    return "Operation failed: memo format is invalid for this transaction type.";
+  }
+
+  return null;
 }

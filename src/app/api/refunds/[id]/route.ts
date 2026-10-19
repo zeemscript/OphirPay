@@ -12,6 +12,7 @@ import { getAuthContext } from "@/lib/auth-session";
 import { verifyCsrf } from "@/lib/csrf";
 import { validateBody, updateRefundStatusSchema } from "@/lib/validation-schemas";
 import { withRequestLogging } from "@/lib/request-logging";
+import { invalidateCache } from "@/lib/api-cache";
 
 // ── PATCH /api/refunds/[id] ───────────────────────────────────
 
@@ -44,6 +45,19 @@ export const PATCH = withMetrics("PATCH /api/refunds/[id]", withRequestLogging(a
       },
     });
     if (result.count === 0) return badRequestError("Refund not found");
+
+    // Persisted audit trail entry for the lifecycle transition (issue #365).
+    await prisma.auditLog.create({
+      data: {
+        action: "refund:status",
+        actor: auth.userId,
+        target: id,
+        details: { status: parsed.data.status },
+      },
+    });
+
+    // The audit trail changed (#741) — flush the cached audit pages.
+    await invalidateCache("audit-log");
 
     return successResponse({ updated: true });
   } catch (err) {

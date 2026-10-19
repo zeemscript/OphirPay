@@ -6,16 +6,17 @@
 
 ## Table of Contents
 
-- [Prerequisites](#-prerequisites)
-- [Environment Variables](#-environment-variables)
-- [Option 1: Vercel (Recommended)](#-option-1-vercel-recommended)
-- [Option 2: Docker](#-option-2-docker)
-- [Option 3: Standalone Node.js](#-option-3-standalone-nodejs)
-- [Option 4: Kubernetes (Helm)](#-option-4-kubernetes-helm)
-- [Soroban Contract Deployment](#-soroban-contract-deployment)
-- [Database Setup](#-database-setup)
-- [Post-Deployment Verification](#-post-deployment-verification)
-- [Troubleshooting](#-troubleshooting)
+- [Prerequisites](#prerequisites)
+- [Environment Variables](#environment-variables)
+- [Option 1: Vercel (Recommended)](#option-1-vercel-recommended)
+- [Option 2: Docker](#option-2-docker)
+- [Option 3: Standalone Node.js](#option-3-standalone-nodejs)
+- [Option 4: Kubernetes (Helm)](#option-4-kubernetes-helm)
+- [Cache Headers for Static Assets and APIs](#cache-headers-for-static-assets-and-apis)
+- [Soroban Contract Deployment](#soroban-contract-deployment)
+- [Database Setup](#database-setup)
+- [Post-Deployment Verification](#post-deployment-verification)
+- [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -65,12 +66,26 @@ cp .env.example .env.local
 |---|---|---|
 | `NODE_ENV` | `development` | `production` for live deploys |
 | `DIRECT_DATABASE_URL` | — | Direct DB URL for Prisma migrations (when using connection pooling) |
-| `RATE_LIMIT_RPM` | `120` | Requests per minute per IP |
-| `REDIS_URL` | — | Redis URL for distributed rate limiting |
-| `NEXT_PUBLIC_SENTRY_DSN` | — | Sentry error tracking DSN |
+| `RATE_LIMIT_RPM` | `120` | Requests per minute per IP (global proxy limit) |
+| `AUTH_RATE_LIMIT_IP_RPM` | `30` | Wallet-auth per-IP requests per minute (`/api/auth/challenge`, `/api/auth/session`) |
+| `AUTH_RATE_LIMIT_WALLET_RPM` | `10` | Wallet-auth per-account requests per minute (keyed by Stellar public key) |
+| `REDIS_URL` | — | Distributed rate limiting. `redis://` = ioredis (Node only); `https://` = Upstash-compatible REST and the only form that shares the *global edge* limit across replicas |
+| `NEXT_PUBLIC_SENTRY_DSN` | — | Optional Sentry DSN for client and server error reporting |
 | `NEXT_PUBLIC_DEMO_MODE` | `false` | Enable demo mode |
 | `NEXT_PUBLIC_FEATURE_MULTI_ASSET` | `false` | Enable multi-asset support |
 | `NEXT_PUBLIC_FEATURE_WEBHOOKS` | `false` | Enable webhook features |
+| `CRON_SECRET` | — | Shared secret protecting `/api/cron`. Required to run the scheduled-payment cron — see [Scheduled Payment Cron](scheduled-payment-cron.md) |
+| `SCHEDULED_PAYMENTS_SOURCE_SECRET` | — | Stellar secret key of the funded operator account that signs due scheduled payments |
+
+### Transactional Email
+
+Required for `src/lib/email.ts` to deliver payment and webhook notification
+emails (Resend is called over its HTTPS API — no SMTP, no extra dependency).
+
+| Variable | Required | Description |
+|---|---|---|
+| `RESEND_API_KEY` | To send email | Resend API key from <https://resend.com/api-keys>. Without it `sendEmail()` throws `EmailConfigurationError` instead of silently dropping the message, and startup logs that email is not configured |
+| `EMAIL_FROM` | No | Sender identity, e.g. `OphirPay <payments@ophirpay.com>`. Must be a verified Resend domain. Defaults to `OphirPay <payments@ophirpay.com>` |
 
 ### Testnet vs Mainnet
 
@@ -93,7 +108,7 @@ Vercel is the easiest way to deploy OphirPay. The project includes a pre-configu
 2. Go to [vercel.com/new](https://vercel.com/new)
 3. Import your forked repository
 4. Vercel auto-detects Next.js — no configuration needed
-5. Add environment variables in the Vercel dashboard (see [Environment Variables](#-environment-variables))
+5. Add environment variables in the Vercel dashboard (see [Environment Variables](#environment-variables))
 6. Click **Deploy**
 
 ### GitHub Integration
@@ -109,10 +124,15 @@ Push to main → Vercel builds → Preview/Production URL
 
 ### Vercel-Specific Notes
 
+> `vercel.json` deliberately declares **no** headers. The app layer
+> (`next.config.ts`) owns them all, so Vercel and self-hosted deployments
+> cannot drift apart — see [Cache Headers for Static Assets and APIs](#cache-headers-for-static-assets-and-apis).
+
 - `output: "standalone"` is **disabled** on Vercel (detected via `process.env.VERCEL`) — Vercel uses its own runtime
 - `npx prisma generate` runs automatically during build (configured in `vercel.json` → `buildCommand`)
 - The `installCommand` is `npm ci` for deterministic installs
 - Region is set to `iad1` (US East) — change in `vercel.json` if you need a different region
+- A cron job runs `/api/cron` every 5 minutes to execute due scheduled payments (`.github/workflows/scheduled-payments-cron.yml` → GitHub Actions schedule; a Vercel Cron entry would fail deployment on Hobby, which only allows daily schedules). Set `CRON_SECRET` (as both a GitHub Actions secret and a Vercel environment variable) and `SCHEDULED_PAYMENTS_SOURCE_SECRET` or the endpoint returns `503` and does nothing — see [Scheduled Payment Cron](scheduled-payment-cron.md)
 
 ### CLI Deploy (Alternative)
 
@@ -207,13 +227,74 @@ The `Dockerfile` uses a 3-stage build:
 |---|---|---|
 | `deps` | `node:24-slim` | Install npm dependencies (with OpenSSL for Prisma) |
 | `builder` | `node:24-slim` | Generate Prisma client, run `next build` |
-| `runner` | `gcr.io/distroless/nodejs20-debian12:nonroot` | Minimal production image (non-root user) |
+| `runner` | `node:24-slim` | Minimal production image, runs as the non-root `node` user |
 
 **Key details:**
 - Uses **Debian (glibc)**, not Alpine (musl) — Tailwind v4's native binaries require glibc
 - Puppeteer download is skipped (`PUPPETEER_SKIP_DOWNLOAD=true`) — not needed for production
 - Final image runs as **non-root** user for security
 - Standalone output is used (configured in `next.config.ts`)
+- The runner stage declares a `HEALTHCHECK` (issue #738) — see below
+- **The runner stage does NOT copy the full `node_modules` from the builder** (issue #737).
+  Next's `output: "standalone"` creates `.next/standalone/node_modules/` with a pruned set of
+  only the runtime dependencies the server actually needs. Copying the full builder
+  `node_modules` on top would double the image size and ship every devDependency
+  (TypeScript, Prisma CLI, Tailwind, Playwright, Puppeteer) into the distroless layer —
+  defeating the purpose of standalone output.  The runner stage only copies the native
+  Prisma query-engine binary, which the standalone tracer intentionally omits because it
+  is platform-specific.
+
+### Liveness vs readiness
+
+OphirPay exposes two probes with deliberately different meanings. They are
+**not** interchangeable: wiring the dependency-aware check to a liveness probe
+lets a transient Postgres/Soroban/Redis outage restart-loop a perfectly healthy
+container.
+
+| Probe | Endpoint | Checks | Failure meaning |
+|---|---|---|---|
+| **Liveness** | `GET /api/health/live` | Process is up and serving HTTP. No database, RPC, Horizon or Redis I/O | The process is wedged — restarting it is the right response |
+| **Readiness** | `GET /api/health` | Database (`SELECT 1`, critical, 503 when down), Soroban RPC + Horizon reachability, Redis ping when `REDIS_URL` is set, and the configured contract ID | A dependency is unavailable — stop routing traffic, do **not** restart |
+
+Both paths are exempt from the global rate limiter (`src/proxy.ts`) so
+orchestrators can poll them even while the app is under load.
+
+**Docker / Docker Compose.** The image ships a `HEALTHCHECK` that probes the
+liveness endpoint with the bundled `node` (the runner image has neither a shell
+nor `curl`/`wget`, so a `node -e 'fetch(...)'` exec-form check is the only
+portable client):
+
+```bash
+docker compose up -d
+docker inspect --format '{{.State.Health.Status}}' ophirpay-app-1   # healthy
+docker inspect --format '{{json .State.Health}}' ophirpay-app-1 | jq .
+```
+
+The healthcheck uses `--interval=30s --timeout=5s --start-period=20s
+--retries=3`, and `docker-compose.yml` restates the same timings next to the
+`db`/`redis` healthchecks so they are easy to tune together.
+
+**Kubernetes / Helm.** The same split is wired in `k8s/deployment.yaml` and
+`helm/ophirpay/values.yaml`:
+
+```yaml
+livenessProbe:                     # process only — never restarts on a DB blip
+  httpGet:
+    path: /api/health/live
+    port: 3000
+  initialDelaySeconds: 30
+  periodSeconds: 15
+  timeoutSeconds: 5
+  failureThreshold: 3
+readinessProbe:                    # dependency-aware — drains traffic on 503
+  httpGet:
+    path: /api/health
+    port: 3000
+  initialDelaySeconds: 10
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 2
+```
 
 ---
 
@@ -316,7 +397,10 @@ server {
 
 ## Option 4: Kubernetes (Helm)
 
-A Helm chart is included in `helm/ophirpay/`.
+A Helm chart is included in `helm/ophirpay/`. See the detailed
+[Kubernetes guide](KUBERNETES.md) for prerequisites, secret provisioning,
+build-time `NEXT_PUBLIC_*` behavior, migrations, probes, ingress/TLS, and the
+pre-flight validation checklist.
 
 ### Deploy with Helm
 
@@ -338,12 +422,27 @@ helm upgrade --install ophirpay ./helm/ophirpay \
   --set image.tag=latest \
   --set ingress.hosts[0].host=ophirpay.com \
   --set config.NEXT_PUBLIC_STELLAR_NETWORK=PUBLIC \
-  --set config.NEXT_PUBLIC_HORIZON_URL=https://horizon.stellar.org \
-  --set config.NEXT_PUBLIC_SOROBAN_RPC_URL=https://soroban.stellar.org \
+  --set config.NEXT_PUBLIC_STELLAR_HORIZON_URL=https://horizon.stellar.org \
+  --set config.NEXT_PUBLIC_STELLAR_RPC_URL=https://soroban.stellar.org:443 \
   --set config.DATABASE_PROVIDER=postgresql \
   --set config.NODE_ENV=production \
   --wait
 ```
+
+> ⚠️ **`NEXT_PUBLIC_*` values are baked in at build time.** Next.js inlines them
+> into the JavaScript bundles during `next build`, so `config.NEXT_PUBLIC_*`
+> entries describe what the running image was built with — they cannot retarget
+> a prebuilt image. To switch networks, build your own image with those
+> variables supplied as build arguments and point the release at it via
+> `--set image.repository` / `--set image.tag`. `helm upgrade` prints the same
+> reminder through `helm/ophirpay/templates/NOTES.txt`.
+>
+> Non-`NEXT_PUBLIC_` variables (for example `STELLAR_NETWORK_PASSPHRASE`) *are*
+> read from the environment at runtime and may be set with
+> `--set config.STELLAR_NETWORK_PASSPHRASE=...`.
+>
+> Every key in `helm/ophirpay/values.yaml` must be a variable documented in
+> `.env.example`; `src/__tests__/helm-config.test.ts` fails the build otherwise.
 
 ### Verify
 
@@ -352,6 +451,50 @@ kubectl get pods -n ophirpay
 kubectl get ingress -n ophirpay
 curl https://ophirpay.com/api/health
 ```
+
+---
+
+## Cache Headers for Static Assets and APIs
+
+`next.config.ts` is the **single source of truth** for the static headers the
+app emits, including `Cache-Control`. Every target — Vercel, Docker, Helm and
+standalone Node — therefore serves identical headers. Do not re-declare these
+headers in `vercel.json`; `src/__tests__/security-headers.test.ts` fails the
+build if the two layers disagree (issues #681 and #740).
+
+| Path | `Cache-Control` | Why |
+|---|---|---|
+| `/_next/static/(.*)` | `public, max-age=31536000, immutable` | Build output is content-addressed: the filename changes when the bytes change, so a 1-year immutable TTL never serves stale code. |
+| `/_next/image` | `public, max-age=3600, stale-while-revalidate=86400` | The optimiser URL is stable but the underlying image can change, so it gets a short TTL plus a background revalidation window instead of a year. |
+| `/api/(.*)` | `no-cache, no-store, must-revalidate` | Never let a browser or intermediary replay financial data. |
+| everything else | *(none set)* | Next's defaults apply. |
+
+All of the above are in addition to the security header set declared on the
+`/(.*)` rule (`X-Content-Type-Options`, `X-Frame-Options`,
+`X-XSS-Protection: 0`, `Referrer-Policy`, `Permissions-Policy`,
+`Strict-Transport-Security`, `Cross-Origin-Opener-Policy`,
+`Cross-Origin-Resource-Policy`), which matches asset and API requests too.
+
+### Verify after deploying
+
+```bash
+# Hashed chunk → long-lived immutable
+curl -sI https://ophirpay.com/_next/static/chunks/main-app-abc123.js \
+  | grep -i cache-control
+# expect: cache-control: public, max-age=31536000, immutable
+
+# API → never cached
+curl -sI https://ophirpay.com/api/stats | grep -i cache-control
+# expect: cache-control: no-cache, no-store, must-revalidate
+
+# Security headers still present on an asset response
+curl -sI https://ophirpay.com/_next/static/chunks/main-app-abc123.js \
+  | grep -i 'x-content-type-options\|strict-transport-security'
+```
+
+> Self-hosted reverse proxies (nginx, Cloudflare, an ingress controller) must
+> not override these values. If you terminate TLS in front of the app, forward
+> the origin's `Cache-Control` untouched rather than setting your own.
 
 ---
 
@@ -438,19 +581,28 @@ DATABASE_URL="postgresql://ophirpay:<password>@<host>:5432/ophirpay" \
 
 ### Connection Pooling (Neon, Supabase)
 
-If your `DATABASE_URL` uses a pooled connection (PgBouncer, Neon), set `DIRECT_DATABASE_URL` for migrations:
+If your `DATABASE_URL` uses a pooled connection (PgBouncer, Neon), Prisma
+migrations need the direct connection. In the committed `prisma/schema.prisma`,
+`directUrl` is commented out, so `DIRECT_DATABASE_URL` alone does not redirect
+Prisma CLI commands. Set `DATABASE_URL` to the direct URL when running
+migrations, or configure `directUrl` in the Prisma datasource:
 
 ```env
 DATABASE_URL=postgresql://user:pass@ep-xxx.pooler.supabase.com:6543/ophirpay
 DIRECT_DATABASE_URL=postgresql://user:pass@ep-xxx.supabase.co:5432/ophirpay
 ```
 
-Prisma uses `DATABASE_URL` at runtime and `DIRECT_DATABASE_URL` for `migrate deploy`.
+The example above documents the two connection strings, but the current
+datasource only reads `DATABASE_URL`. See the
+[Database Provider Compatibility guide](DATABASE_PROVIDERS.md) for details.
 
 ### SQLite (Development Only)
 
 ```bash
-DATABASE_PROVIDER=sqlite npx prisma db push
+# DATABASE_PROVIDER alone does not switch Prisma's datasource.
+# SQLite requires local, uncommitted schema edits first; see:
+# docs/LOCAL_DEV.md and docs/DATABASE_PROVIDERS.md
+npx prisma db push
 ```
 
 > ⚠️ SQLite is for local development only. Production must use PostgreSQL.
@@ -459,21 +611,36 @@ DATABASE_PROVIDER=sqlite npx prisma db push
 
 ## Post-Deployment Verification
 
+### Stellar wallet discovery (SEP-1)
+
+The application serves a SEP-1 discovery document at
+`https://<your-domain>/.well-known/stellar.toml`. It is generated at request
+time from the deployment's Stellar network, network passphrase, RPC/Horizon
+URLs, and configured OphirPay/emitter contract IDs, so each environment reports
+its own deployment metadata. The document also publishes the network-specific
+USDC issuer and links to the deployment and security documentation. Verify the
+endpoint after deployment and confirm its `NETWORK_PASSPHRASE`,
+`OPHIRPAY_CONTRACT_ID`, and `EMITTER_CONTRACT_ID` values match the variables
+configured for that deployment.
+
 Run these checks after deploying:
 
 ```bash
-# 1. Health check
+# 1. SEP-1 discovery document
+curl -fsS https://your-domain.com/.well-known/stellar.toml
+
+# 2. Health check
 curl -s https://your-domain.com/api/health | jq .
 
-# 2. Check the dashboard loads
+# 3. Check the dashboard loads
 curl -s -o /dev/null -w "%{http_code}" https://your-domain.com/
 # Expected: 200
 
-# 3. Check API routes
+# 4. Check API routes
 curl -s -o /dev/null -w "%{http_code}" https://your-domain.com/api/health
 # Expected: 200
 
-# 4. Verify database connectivity
+# 5. Verify database connectivity
 curl -s https://your-domain.com/api/health | jq .database
 # Expected: "connected"
 ```
@@ -496,7 +663,7 @@ curl -s https://your-domain.com/api/health | jq .database
 |---|---|---|
 | `Prisma generate failed` | Prisma CLI not installed | Run `npx prisma generate` explicitly, or `npm ci` to install devDependencies |
 | `ENOENT: no such file or directory, open '.env'` | Missing `.env` file | Copy `.env.example` to `.env.local` |
-| `tailwindcss/postcss` crash on musl | Alpine Linux uses musl libc | Use the Debian-based Dockerfile (already configured) or switch to `node:20-slim` |
+| `tailwindcss/postcss` crash on musl | Alpine Linux uses musl libc | Use the Debian-based Dockerfile (already configured) or switch to `node:24-slim` |
 | `next build` fails with `ENOENT .next/next-server.js.nft.json` | Standalone mode on Vercel | Already handled — `output` is disabled when `VERCEL` env is set |
 
 ### Database Errors
